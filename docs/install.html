@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VoxStick 网页烧录器</title>
+    <meta
+      name="description"
+      content="直接从 Chrome 或 Edge 把 VoxStick 固件刷进 M5Stack StickS3。"
+    />
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+    ></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f6f8fb;
+        --panel: #ffffff;
+        --text: #172033;
+        --muted: #5c687a;
+        --line: #d9e0ea;
+        --accent: #147e63;
+        --accent-dark: #0f604c;
+        --accent-soft: #dff5ee;
+        --warn: #8a5a00;
+        --warn-bg: #fff4d8;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #11151c;
+          --panel: #181f2a;
+          --text: #edf3fb;
+          --muted: #a8b2c1;
+          --line: #2a3545;
+          --accent: #2fc49b;
+          --accent-dark: #25ad88;
+          --accent-soft: #17382f;
+          --warn: #ffd37a;
+          --warn-bg: #3c2c0f;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--page);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "Microsoft YaHei", sans-serif;
+        line-height: 1.55;
+      }
+
+      main {
+        width: min(1040px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 40px 0 48px;
+      }
+
+      header {
+        display: grid;
+        gap: 12px;
+        padding-bottom: 24px;
+      }
+
+      .topline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .eyebrow {
+        color: var(--accent);
+        font-size: 0.85rem;
+        font-weight: 750;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      .lang {
+        color: var(--accent);
+        font-weight: 700;
+      }
+
+      .top-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2.1rem, 6vw, 4.4rem);
+        line-height: 1;
+        letter-spacing: 0;
+      }
+
+      .lede {
+        max-width: 760px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 1.05rem;
+      }
+
+      .visual-grid,
+      .content-grid {
+        display: grid;
+        gap: 18px;
+      }
+
+      .visual-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        margin-bottom: 24px;
+      }
+
+      .content-grid {
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
+        align-items: start;
+      }
+
+      .panel,
+      .visual-card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      .panel {
+        padding: 24px;
+      }
+
+      .visual-card {
+        margin: 0;
+        overflow: hidden;
+      }
+
+      .visual-media {
+        display: block;
+        width: 100%;
+        aspect-ratio: 1 / 1;
+        object-fit: contain;
+        background: #ffffff;
+      }
+
+      figcaption {
+        padding: 10px 12px 12px;
+        color: var(--muted);
+        font-size: 0.94rem;
+      }
+
+      .flash-panel {
+        display: grid;
+        gap: 18px;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .meta li {
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 5px 10px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      esp-web-install-button {
+        --esp-tools-button-color: var(--accent);
+        --esp-tools-button-text-color: #ffffff;
+        --esp-tools-button-border-radius: 8px;
+      }
+
+      button[slot="activate"] {
+        width: 100%;
+        min-height: 52px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #ffffff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 750;
+      }
+
+      button[slot="activate"]:hover {
+        background: var(--accent-dark);
+      }
+
+      .notice {
+        margin: 0;
+        border-radius: 8px;
+        background: var(--warn-bg);
+        color: var(--warn);
+        padding: 12px 14px;
+        font-size: 0.95rem;
+      }
+
+      h2 {
+        margin: 0 0 14px;
+        font-size: 1.1rem;
+        letter-spacing: 0;
+      }
+
+      ol,
+      ul {
+        margin: 0;
+        padding-left: 1.25rem;
+      }
+
+      li + li {
+        margin-top: 10px;
+      }
+
+      code {
+        border-radius: 5px;
+        background: var(--accent-soft);
+        color: var(--text);
+        padding: 0.12em 0.35em;
+      }
+
+      a {
+        color: var(--accent);
+      }
+
+      .fine-print {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      @media (max-width: 820px) {
+        main {
+          padding-top: 28px;
+        }
+
+        .visual-grid,
+        .content-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="topline">
+          <div class="eyebrow">M5Stack StickS3 / ESP32-S3</div>
+          <div class="top-links">
+            <a class="lang" href="./config.html">配置</a>
+            <a class="lang" href="./install-en.html">English</a>
+          </div>
+        </div>
+        <h1>VoxStick 网页烧录器</h1>
+        <p class="lede">
+          直接从浏览器把 VoxStick 固件刷进 M5Stack StickS3。普通用户不需要安装
+          ESP-IDF、Python 或 esptool。
+        </p>
+      </header>
+
+      <section class="visual-grid" aria-label="VoxStick 真机和姿态">
+        <figure class="visual-card">
+          <img
+            class="visual-media"
+            src="https://m5stack-doc.oss-cn-shenzhen.aliyuncs.com/1207/K150-stickS3_main-products_02.webp"
+            alt="M5Stack StickS3 真机外观"
+          />
+          <figcaption>真机外观</figcaption>
+        </figure>
+        <figure class="visual-card">
+          <img
+            class="visual-media"
+            src="./assets/voxstick-upright-live.png"
+            alt="StickS3 竖放，屏幕显示开麦"
+          />
+          <figcaption>竖放：开麦收音</figcaption>
+        </figure>
+        <figure class="visual-card">
+          <img
+            class="visual-media"
+            src="./assets/voxstick-flat-muted.png"
+            alt="StickS3 平放，LCD 屏幕朝上并显示闭麦"
+          />
+          <figcaption>屏幕朝上平放：自动闭麦</figcaption>
+        </figure>
+      </section>
+
+      <section class="content-grid">
+        <div class="panel flash-panel">
+          <ul class="meta">
+            <li>固件 v0.1.6</li>
+            <li>目标 ESP32-S3</li>
+            <li>写入地址 0x0</li>
+          </ul>
+
+          <esp-web-install-button manifest="./firmware/v0.1.6/manifest.json">
+            <button slot="activate">连接并烧录 VoxStick</button>
+            <span slot="unsupported">请使用桌面版 Chrome 或 Microsoft Edge 打开本页。</span>
+            <span slot="not-allowed">请通过 HTTPS 或 localhost 打开本页。</span>
+          </esp-web-install-button>
+
+          <p class="notice">
+            烧录完成后可能不会自动重启。请拔掉 USB，双击侧边键关机，再插回 USB。
+          </p>
+        </div>
+
+        <aside class="panel">
+          <h2>烧录步骤</h2>
+          <ol>
+            <li><strong>电脑：</strong>用桌面版 Chrome 或 Microsoft Edge 打开本页。</li>
+            <li><strong>硬件：</strong>用能传数据的 USB-C 线把 StickS3 连接到电脑。</li>
+            <li><strong>硬件：</strong>长按 StickS3 侧边 reset/PWR 键约 2 秒，看到机身内部绿色 LED 闪烁后松开。</li>
+            <li><strong>本页面：</strong>点击烧录面板中的“连接并烧录 VoxStick”按钮；浏览器弹出串口选择框时，选择 StickS3 串口并确认安装。</li>
+            <li><strong>硬件：</strong>页面提示烧录完成后，拔掉 USB，双击 StickS3 侧边键关机，再插回 USB 启动新固件。</li>
+            <li><strong>电脑系统：</strong>固件启动后，在系统声音输入中选择 <code>StickS3-Mic</code>。</li>
+            <li><strong>微信输入法：</strong>打开“设置 → 语音输入 → 免提模式 → 设置快捷键”，按一下 StickS3 正面大按键，绑定 <code>Ctrl+F12</code>（固件实际发左 Ctrl，macOS 可能显示为 <code>⌃F12</code>）。</li>
+            <li><strong>可选配置：</strong>打开 <a href="./config.html">VoxStick 配置页</a>，修改平放闭麦和按键触发键。</li>
+          </ol>
+        </aside>
+      </section>
+
+      <section class="panel" style="margin-top: 24px">
+        <h2>故障恢复</h2>
+        <ul>
+          <li>看不到串口：换一根 USB-C 数据线，确认浏览器是桌面版 Chrome/Edge。</li>
+          <li>仍然看不到串口：重新长按侧边键约 2 秒，绿色 LED 闪烁后松开。</li>
+          <li>已运行 VoxStick 固件时，也可以执行 <code>bash tools/trigger-download.sh</code> 进入下载模式。</li>
+          <li>命令行兜底：<code>esptool.py --chip esp32s3 write_flash 0x0 voxstick-full.bin</code></li>
+        </ul>
+        <p class="fine-print">
+          真机图片和按键说明参考
+          <a href="https://docs.m5stack.com/en/core/StickS3">M5Stack StickS3 官方文档</a>。
+          项目源码：
+          <a href="https://github.com/openbrt/voxstick">github.com/openbrt/voxstick</a>
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

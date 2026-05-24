@@ -1,0 +1,126 @@
+name: build + release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for action-gh-release to publish on tags
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache IDF Component Manager downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            managed_components
+            dependencies.lock
+          key: ${{ runner.os }}-idf-components-${{ hashFiles('main/idf_component.yml') }}
+
+      - name: Build firmware (ESP-IDF v5.5)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: esp32s3
+          path: '.'
+
+      - name: Compute version metadata
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(git rev-parse --short HEAD)"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_dir=voxstick-$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Stage release artifacts (merged + individual bins)
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.meta.outputs.release_dir }}"
+          mkdir -p "$DIR"
+
+          # Individual partitions exactly as `idf.py flash` writes them.
+          cp build/voxstick.bin                    "$DIR/voxstick.bin"
+          cp build/bootloader/bootloader.bin       "$DIR/bootloader.bin"
+          cp build/partition_table/partition-table.bin "$DIR/partition-table.bin"
+          cp build/flasher_args.json               "$DIR/flasher_args.json" || true
+
+          # One-shot full image (8 MB padded). Flashable at 0x0 with esptool
+          # for users who don't want to mess with three offsets.
+          python -m pip install --quiet esptool
+          python -m esptool --chip esp32s3 merge_bin \
+              -o "$DIR/voxstick-full.bin" \
+              --flash_mode dio --flash_size 8MB --flash_freq 80m \
+              0x0     "$DIR/bootloader.bin" \
+              0x8000  "$DIR/partition-table.bin" \
+              0x10000 "$DIR/voxstick.bin"
+
+          # Reflash one-liner shipped with the artifact for end users.
+          cat > "$DIR/FLASH-README.md" <<EOF
+          # voxstick ${{ steps.meta.outputs.version }}
+
+          Browser install (easiest):
+
+              https://openbrt.github.io/voxstick/install.html
+
+          Use desktop Chrome or Microsoft Edge, connect the M5Stack StickS3,
+          then click "Connect and flash".
+
+          One-shot flash (8 MB image, easiest):
+
+              esptool.py --chip esp32s3 -p /dev/cu.usbmodem* write_flash 0x0 voxstick-full.bin
+
+          Or three-part flash (matches \`idf.py flash\`):
+
+              esptool.py --chip esp32s3 -p /dev/cu.usbmodem* write_flash \\
+                  0x0     bootloader.bin \\
+                  0x8000  partition-table.bin \\
+                  0x10000 voxstick.bin
+
+          Hardware: M5Stack StickS3. After flash, recover from ROM with:
+
+              esptool.py --chip esp32s3 -p /dev/cu.usbmodem* \\
+                  --before no_reset --after watchdog_reset read_mac
+          EOF
+
+          ls -lh "$DIR"
+
+      - name: Upload build artifacts (always, for inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxstick-${{ steps.meta.outputs.version }}
+          path: ${{ steps.meta.outputs.release_dir }}/
+          if-no-files-found: error
+
+      - name: Pack tag artifacts as a single archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          DIR="${{ steps.meta.outputs.release_dir }}"
+          zip -r "$DIR.zip" "$DIR"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.meta.outputs.release_dir }}/voxstick-full.bin
+            ${{ steps.meta.outputs.release_dir }}/voxstick.bin
+            ${{ steps.meta.outputs.release_dir }}/bootloader.bin
+            ${{ steps.meta.outputs.release_dir }}/partition-table.bin
+            ${{ steps.meta.outputs.release_dir }}/FLASH-README.md
+            ${{ steps.meta.outputs.release_dir }}.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

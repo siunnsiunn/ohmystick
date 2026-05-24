@@ -1,0 +1,1049 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VoxStick 配置</title>
+    <meta
+      name="description"
+      content="通过 WebUSB 配置 VoxStick 的平放闭麦和按键触发键。"
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f6f8fb;
+        --panel: #ffffff;
+        --text: #172033;
+        --muted: #5c687a;
+        --line: #d9e0ea;
+        --accent: #147e63;
+        --accent-dark: #0f604c;
+        --accent-soft: #dff5ee;
+        --danger: #b3261e;
+        --danger-soft: #ffe5e2;
+        --warn: #8a5a00;
+        --warn-bg: #fff4d8;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #11151c;
+          --panel: #181f2a;
+          --text: #edf3fb;
+          --muted: #a8b2c1;
+          --line: #2a3545;
+          --accent: #2fc49b;
+          --accent-dark: #25ad88;
+          --accent-soft: #17382f;
+          --danger: #ffb4ab;
+          --danger-soft: #4e1d19;
+          --warn: #ffd37a;
+          --warn-bg: #3c2c0f;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--page);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "Microsoft YaHei", sans-serif;
+        line-height: 1.55;
+      }
+
+      main {
+        width: 100%;
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 32px 16px 48px;
+      }
+
+      header {
+        display: grid;
+        gap: 10px;
+        padding-bottom: 22px;
+      }
+
+      .topline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .eyebrow {
+        color: var(--accent);
+        font-size: 0.85rem;
+        font-weight: 750;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      a {
+        color: var(--accent);
+        font-weight: 700;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2rem, 5vw, 3.6rem);
+        line-height: 1;
+        letter-spacing: 0;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+        gap: 18px;
+        align-items: start;
+      }
+
+      .panel {
+        min-width: 0;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 22px;
+      }
+
+      .connect-row,
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      button {
+        min-height: 44px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 0 16px;
+        background: var(--accent);
+        color: #ffffff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 750;
+      }
+
+      button:hover {
+        background: var(--accent-dark);
+      }
+
+      button.secondary {
+        border-color: var(--line);
+        background: transparent;
+        color: var(--text);
+      }
+
+      button.secondary:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+
+      button.danger {
+        background: var(--danger-soft);
+        color: var(--danger);
+      }
+
+      button:disabled,
+      fieldset:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .status {
+        min-height: 1.6em;
+        margin: 12px 0 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .status[data-tone="ok"] {
+        color: var(--accent);
+      }
+
+      .status[data-tone="warn"] {
+        color: var(--warn);
+      }
+
+      .status[data-tone="error"] {
+        color: var(--danger);
+      }
+
+      fieldset {
+        display: grid;
+        gap: 0;
+        margin: 18px 0 0;
+        padding: 0;
+        border: 0;
+      }
+
+      .setting {
+        display: grid;
+        gap: 10px;
+        padding: 18px 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .setting:first-child {
+        padding-top: 0;
+        border-top: 0;
+      }
+
+      label,
+      .sub-label {
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      .check {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .check input {
+        width: 18px;
+        height: 18px;
+        accent-color: var(--accent);
+      }
+
+      select,
+      input[type="number"] {
+        min-width: 0;
+        width: 100%;
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--text);
+        font: inherit;
+        padding: 8px 10px;
+      }
+
+      select:focus,
+      input[type="number"]:focus {
+        border-color: var(--accent);
+        outline: 2px solid var(--accent-soft);
+      }
+
+      .custom-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(120px, 160px);
+        gap: 12px;
+      }
+
+      .mod-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .mod-grid label {
+        display: flex;
+        min-height: 38px;
+        gap: 6px;
+        align-items: center;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 8px;
+        color: var(--muted);
+        font-size: 0.9rem;
+        font-weight: 650;
+      }
+
+      .mod-grid input {
+        accent-color: var(--accent);
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      .summary {
+        display: grid;
+        gap: 18px;
+      }
+
+      .device-photo {
+        display: block;
+        width: 100%;
+        aspect-ratio: 1 / 1;
+        object-fit: contain;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #ffffff;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 1.08rem;
+        letter-spacing: 0;
+      }
+
+      dl {
+        display: grid;
+        grid-template-columns: 96px minmax(0, 1fr);
+        gap: 8px 12px;
+        margin: 0;
+      }
+
+      dt {
+        color: var(--muted);
+      }
+
+      dd {
+        margin: 0;
+        font-weight: 700;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 28px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 3px 10px;
+        color: var(--muted);
+        font-size: 0.9rem;
+        font-weight: 700;
+      }
+
+      .fine-print {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      code {
+        border-radius: 5px;
+        background: var(--accent-soft);
+        color: var(--text);
+        padding: 0.12em 0.35em;
+      }
+
+      @media (max-width: 860px) {
+        .layout,
+        .custom-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .mod-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 520px) {
+        .topline {
+          align-items: flex-start;
+        }
+
+        nav {
+          width: 100%;
+        }
+
+        .actions {
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .actions button {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="topline">
+          <div class="eyebrow">VoxStick / WebUSB</div>
+          <nav>
+            <a href="./install.html">网页烧录器</a>
+            <a href="https://github.com/openbrt/voxstick">源码</a>
+          </nav>
+        </div>
+        <h1>VoxStick 配置</h1>
+      </header>
+
+      <section class="layout">
+        <section class="panel" aria-label="配置表单">
+          <div class="connect-row">
+            <button id="connectBtn" type="button">连接 VoxStick</button>
+            <span id="dirtyBadge" class="badge">未连接</span>
+          </div>
+          <p id="status" class="status">
+            请使用桌面版 Chrome 或 Microsoft Edge 打开本页。
+          </p>
+
+          <form id="configForm">
+            <fieldset id="configFieldset" disabled>
+              <div class="setting">
+                <label class="check">
+                  <input id="flatMute" type="checkbox" />
+                  <span>平放自动闭麦</span>
+                </label>
+              </div>
+
+              <div class="setting">
+                <label for="tapPreset">轻按触发键</label>
+                <select id="tapPreset">
+                  <option value="leftCtrlF12">微信输入法：左 Ctrl + F12</option>
+                  <option value="rightCtrlF12">右 Ctrl + F12</option>
+                  <option value="f19">F19</option>
+                  <option value="f20">F20</option>
+                  <option value="custom">自定义</option>
+                </select>
+                <div id="tapCustom" class="custom-grid hidden">
+                  <div>
+                    <div class="sub-label">修饰键</div>
+                    <div id="tapModifiers" class="mod-grid"></div>
+                  </div>
+                  <div>
+                    <label for="tapKey">按键</label>
+                    <select id="tapKey"></select>
+                  </div>
+                </div>
+              </div>
+
+              <div class="setting">
+                <label for="holdPreset">长按触发键</label>
+                <select id="holdPreset">
+                  <option value="enter">Enter</option>
+                  <option value="none">不发送按键</option>
+                  <option value="f20">F20</option>
+                  <option value="custom">自定义</option>
+                </select>
+                <div id="holdCustom" class="custom-grid hidden">
+                  <div>
+                    <div class="sub-label">修饰键</div>
+                    <div id="holdModifiers" class="mod-grid"></div>
+                  </div>
+                  <div>
+                    <label for="holdKey">按键</label>
+                    <select id="holdKey"></select>
+                  </div>
+                </div>
+              </div>
+
+              <div class="setting">
+                <label for="longPressMs">长按阈值</label>
+                <input
+                  id="longPressMs"
+                  type="number"
+                  min="250"
+                  max="2000"
+                  step="50"
+                  inputmode="numeric"
+                />
+              </div>
+
+              <div class="setting">
+                <div class="actions">
+                  <button id="saveBtn" type="button">保存到 VoxStick</button>
+                  <button id="reloadBtn" class="secondary" type="button">
+                    重新读取
+                  </button>
+                  <button id="resetBtn" class="danger" type="button">
+                    恢复默认
+                  </button>
+                </div>
+              </div>
+            </fieldset>
+          </form>
+        </section>
+
+        <aside class="panel summary" aria-label="当前配置">
+          <img
+            class="device-photo"
+            src="https://m5stack-doc.oss-cn-shenzhen.aliyuncs.com/1207/K150-stickS3_main-products_02.webp"
+            alt="M5Stack StickS3 真机外观"
+          />
+          <h2>当前配置</h2>
+          <dl>
+            <dt>连接</dt>
+            <dd id="summaryConnection">未连接</dd>
+            <dt>平放闭麦</dt>
+            <dd id="summaryFlat">-</dd>
+            <dt>轻按</dt>
+            <dd id="summaryTap">-</dd>
+            <dt>长按</dt>
+            <dd id="summaryHold">-</dd>
+            <dt>阈值</dt>
+            <dd id="summaryPress">-</dd>
+          </dl>
+          <p class="fine-print">
+            配置保存在设备 NVS 中。需要固件 <code>v0.1.6</code> 或更新版本。
+          </p>
+        </aside>
+      </section>
+    </main>
+
+    <script>
+      "use strict";
+
+      const VOX_VID = 0x303a;
+      const VOX_PID = 0x8001;
+      const PROTOCOL_VERSION = 1;
+      const CMD_GET = 1;
+      const CMD_SET = 2;
+      const CMD_RESET = 3;
+      const STATUS_OK = 0;
+      const CONFIG_SIZE = 12;
+      const TRANSFER_TIMEOUT_MS = 1500;
+
+      const DEFAULT_CONFIG = {
+        flatMute: true,
+        tapModifier: 0x01,
+        tapKeycode: 0x45,
+        holdModifier: 0,
+        holdKeycode: 0x28,
+        longPressMs: 600,
+      };
+
+      const MODIFIERS = [
+        { bit: 0x01, label: "左 Ctrl" },
+        { bit: 0x02, label: "左 Shift" },
+        { bit: 0x04, label: "左 Alt" },
+        { bit: 0x08, label: "左 GUI" },
+        { bit: 0x10, label: "右 Ctrl" },
+        { bit: 0x20, label: "右 Shift" },
+        { bit: 0x40, label: "右 Alt" },
+        { bit: 0x80, label: "右 GUI" },
+      ];
+
+      const KEY_OPTIONS = [
+        { code: 0x45, label: "F12" },
+        { code: 0x68, label: "F13" },
+        { code: 0x69, label: "F14" },
+        { code: 0x6a, label: "F15" },
+        { code: 0x6b, label: "F16" },
+        { code: 0x6c, label: "F17" },
+        { code: 0x6d, label: "F18" },
+        { code: 0x6e, label: "F19" },
+        { code: 0x6f, label: "F20" },
+        { code: 0x70, label: "F21" },
+        { code: 0x71, label: "F22" },
+        { code: 0x72, label: "F23" },
+        { code: 0x73, label: "F24" },
+        { code: 0x28, label: "Enter" },
+        { code: 0x2c, label: "Space" },
+        { code: 0x2b, label: "Tab" },
+        { code: 0x29, label: "Esc" },
+      ];
+
+      const TAP_PRESETS = {
+        leftCtrlF12: { modifier: 0x01, keycode: 0x45 },
+        rightCtrlF12: { modifier: 0x10, keycode: 0x45 },
+        f19: { modifier: 0, keycode: 0x6e },
+        f20: { modifier: 0, keycode: 0x6f },
+      };
+
+      const HOLD_PRESETS = {
+        enter: { modifier: 0, keycode: 0x28 },
+        none: { modifier: 0, keycode: 0 },
+        f20: { modifier: 0, keycode: 0x6f },
+      };
+
+      const STATUS_TEXT = {
+        1: "设备不认识这条配置请求。",
+        2: "配置值不合法。",
+        3: "设备保存配置失败。",
+      };
+
+      const state = {
+        device: null,
+        interfaceNumber: null,
+        inEndpoint: null,
+        outEndpoint: null,
+        connected: false,
+        dirty: false,
+      };
+
+      const $ = (id) => document.getElementById(id);
+
+      function setStatus(text, tone = "") {
+        $("status").textContent = text;
+        $("status").dataset.tone = tone;
+      }
+
+      function setDirty(value) {
+        state.dirty = value;
+        $("dirtyBadge").textContent = state.connected
+          ? value
+            ? "有未保存改动"
+            : "已同步"
+          : "未连接";
+      }
+
+      function setConnected(value) {
+        state.connected = value;
+        $("configFieldset").disabled = !value;
+        $("summaryConnection").textContent = value ? "已连接" : "未连接";
+        setDirty(false);
+      }
+
+      function withTimeout(promise, message) {
+        return new Promise((resolve, reject) => {
+          const timer = window.setTimeout(
+            () => reject(new Error(message)),
+            TRANSFER_TIMEOUT_MS,
+          );
+          promise.then(
+            (value) => {
+              window.clearTimeout(timer);
+              resolve(value);
+            },
+            (error) => {
+              window.clearTimeout(timer);
+              reject(error);
+            },
+          );
+        });
+      }
+
+      function populateModifiers(id) {
+        const html = MODIFIERS.map(
+          (mod) => `
+            <label>
+              <input type="checkbox" data-modifier="${mod.bit}" />
+              <span>${mod.label}</span>
+            </label>
+          `,
+        ).join("");
+        $(id).innerHTML = html;
+      }
+
+      function populateKeys(selectId, allowNone) {
+        const options = allowNone
+          ? [{ code: 0, label: "不发送按键" }, ...KEY_OPTIONS]
+          : KEY_OPTIONS;
+        $(selectId).innerHTML = options
+          .map((key) => `<option value="${key.code}">${key.label}</option>`)
+          .join("");
+      }
+
+      function keyName(keycode) {
+        if (keycode === 0) {
+          return "不发送按键";
+        }
+        const found = KEY_OPTIONS.find((key) => key.code === keycode);
+        return found ? found.label : `0x${keycode.toString(16).padStart(2, "0")}`;
+      }
+
+      function modifierName(mask) {
+        const names = MODIFIERS
+          .filter((mod) => (mask & mod.bit) !== 0)
+          .map((mod) => mod.label);
+        return names.join(" + ");
+      }
+
+      function actionName(modifier, keycode) {
+        if (keycode === 0) {
+          return "不发送按键";
+        }
+        const mods = modifierName(modifier);
+        const key = keyName(keycode);
+        return mods ? `${mods} + ${key}` : key;
+      }
+
+      function setModifierUi(kind, mask) {
+        document
+          .querySelectorAll(`#${kind}Modifiers input[data-modifier]`)
+          .forEach((input) => {
+            const bit = Number(input.dataset.modifier);
+            input.checked = (mask & bit) !== 0;
+          });
+      }
+
+      function getModifierUi(kind) {
+        let mask = 0;
+        document
+          .querySelectorAll(`#${kind}Modifiers input[data-modifier]:checked`)
+          .forEach((input) => {
+            mask |= Number(input.dataset.modifier);
+          });
+        return mask;
+      }
+
+      function ensureKeyOption(selectId, keycode) {
+        const select = $(selectId);
+        if ([...select.options].some((option) => Number(option.value) === keycode)) {
+          return;
+        }
+        const option = document.createElement("option");
+        option.value = String(keycode);
+        option.textContent = keyName(keycode);
+        select.append(option);
+      }
+
+      function findPreset(map, modifier, keycode) {
+        for (const [name, preset] of Object.entries(map)) {
+          if (preset.modifier === modifier && preset.keycode === keycode) {
+            return name;
+          }
+        }
+        return "custom";
+      }
+
+      function writeActionUi(kind, modifier, keycode) {
+        const map = kind === "tap" ? TAP_PRESETS : HOLD_PRESETS;
+        const preset = findPreset(map, modifier, keycode);
+        $(`${kind}Preset`).value = preset;
+        setModifierUi(kind, modifier);
+        ensureKeyOption(`${kind}Key`, keycode);
+        $(`${kind}Key`).value = String(keycode);
+        renderCustomVisibility(kind);
+      }
+
+      function applyPreset(kind) {
+        const map = kind === "tap" ? TAP_PRESETS : HOLD_PRESETS;
+        const preset = map[$(`${kind}Preset`).value];
+        if (preset) {
+          setModifierUi(kind, preset.modifier);
+          ensureKeyOption(`${kind}Key`, preset.keycode);
+          $(`${kind}Key`).value = String(preset.keycode);
+        }
+        renderCustomVisibility(kind);
+      }
+
+      function readActionUi(kind) {
+        return {
+          modifier: getModifierUi(kind),
+          keycode: Number($(`${kind}Key`).value),
+        };
+      }
+
+      function renderCustomVisibility(kind) {
+        $(`${kind}Custom`).classList.toggle(
+          "hidden",
+          $(`${kind}Preset`).value !== "custom",
+        );
+      }
+
+      function writeConfigUi(config) {
+        $("flatMute").checked = config.flatMute;
+        writeActionUi("tap", config.tapModifier, config.tapKeycode);
+        writeActionUi("hold", config.holdModifier, config.holdKeycode);
+        $("longPressMs").value = String(config.longPressMs);
+        updateSummary(config);
+      }
+
+      function readConfigUi() {
+        const tap = readActionUi("tap");
+        const hold = readActionUi("hold");
+        const longPressMs = Number($("longPressMs").value);
+        if (!tap.keycode) {
+          throw new Error("轻按触发键不能为空。");
+        }
+        if (longPressMs < 250 || longPressMs > 2000) {
+          throw new Error("长按阈值必须在 250 到 2000 ms 之间。");
+        }
+        return {
+          flatMute: $("flatMute").checked,
+          tapModifier: tap.modifier,
+          tapKeycode: tap.keycode,
+          holdModifier: hold.modifier,
+          holdKeycode: hold.keycode,
+          longPressMs,
+        };
+      }
+
+      function readConfigUiSafe() {
+        try {
+          return readConfigUi();
+        } catch {
+          return null;
+        }
+      }
+
+      function updateSummary(config = readConfigUiSafe()) {
+        if (!config) {
+          $("summaryFlat").textContent = "-";
+          $("summaryTap").textContent = "-";
+          $("summaryHold").textContent = "-";
+          $("summaryPress").textContent = "-";
+          return;
+        }
+        $("summaryFlat").textContent = config.flatMute ? "开启" : "关闭";
+        $("summaryTap").textContent = actionName(
+          config.tapModifier,
+          config.tapKeycode,
+        );
+        $("summaryHold").textContent = actionName(
+          config.holdModifier,
+          config.holdKeycode,
+        );
+        $("summaryPress").textContent = `${config.longPressMs} ms`;
+      }
+
+      function findVendorInterface(configuration) {
+        for (const iface of configuration.interfaces) {
+          for (const alternate of iface.alternates) {
+            if (alternate.interfaceClass !== 0xff) {
+              continue;
+            }
+            const outEndpoint = alternate.endpoints.find(
+              (endpoint) =>
+                endpoint.direction === "out" && endpoint.type === "bulk",
+            );
+            const inEndpoint = alternate.endpoints.find(
+              (endpoint) =>
+                endpoint.direction === "in" && endpoint.type === "bulk",
+            );
+            if (outEndpoint && inEndpoint) {
+              return {
+                interfaceNumber: iface.interfaceNumber,
+                alternateSetting: alternate.alternateSetting,
+                outEndpoint: outEndpoint.endpointNumber,
+                inEndpoint: inEndpoint.endpointNumber,
+              };
+            }
+          }
+        }
+        throw new Error("没有找到 VoxStick vendor 配置接口。");
+      }
+
+      function encodeRequest(command, payload = new Uint8Array()) {
+        const packet = new Uint8Array(8 + payload.length);
+        packet.set([0x56, 0x58, 0x43, 0x46, PROTOCOL_VERSION, command], 0);
+        packet[6] = payload.length & 0xff;
+        packet[7] = (payload.length >> 8) & 0xff;
+        packet.set(payload, 8);
+        return packet;
+      }
+
+      function parseResponse(result) {
+        if (result.status !== "ok" || !result.data) {
+          throw new Error("设备没有返回配置数据。");
+        }
+        const data = new Uint8Array(
+          result.data.buffer,
+          result.data.byteOffset,
+          result.data.byteLength,
+        );
+        if (
+          data.byteLength < 8 ||
+          data[0] !== 0x56 ||
+          data[1] !== 0x58 ||
+          data[2] !== 0x43 ||
+          data[3] !== 0x52
+        ) {
+          throw new Error("设备返回的数据格式不对。");
+        }
+        if (data[4] !== PROTOCOL_VERSION) {
+          throw new Error(`配置协议版本不兼容：${data[4]}`);
+        }
+        const status = data[5];
+        const payloadLen = data[6] | (data[7] << 8);
+        if (data.byteLength < 8 + payloadLen) {
+          throw new Error("设备返回的数据不完整。");
+        }
+        if (status !== STATUS_OK) {
+          throw new Error(STATUS_TEXT[status] || `设备返回状态 ${status}。`);
+        }
+        return data.slice(8, 8 + payloadLen);
+      }
+
+      async function sendCommand(command, payload) {
+        if (!state.device || state.outEndpoint == null || state.inEndpoint == null) {
+          throw new Error("VoxStick 尚未连接。");
+        }
+        const request = encodeRequest(command, payload);
+        const out = await withTimeout(
+          state.device.transferOut(state.outEndpoint, request),
+          "写入配置超时。",
+        );
+        if (out.status !== "ok") {
+          throw new Error("写入配置失败。");
+        }
+        const response = await withTimeout(
+          state.device.transferIn(state.inEndpoint, 64),
+          "读取配置超时，请先刷入 v0.1.6 或更新版本固件。",
+        );
+        return parseResponse(response);
+      }
+
+      function encodeConfig(config) {
+        const payload = new Uint8Array(CONFIG_SIZE);
+        const view = new DataView(payload.buffer);
+        payload[0] = config.flatMute ? 1 : 0;
+        payload[1] = config.tapModifier;
+        payload[2] = config.tapKeycode;
+        payload[3] = config.holdModifier;
+        payload[4] = config.holdKeycode;
+        view.setUint16(6, config.longPressMs, true);
+        view.setUint32(8, 0, true);
+        return payload;
+      }
+
+      function decodeConfig(payload) {
+        if (payload.byteLength !== CONFIG_SIZE) {
+          throw new Error("设备返回的配置长度不对。");
+        }
+        const view = new DataView(
+          payload.buffer,
+          payload.byteOffset,
+          payload.byteLength,
+        );
+        return {
+          flatMute: payload[0] !== 0,
+          tapModifier: payload[1],
+          tapKeycode: payload[2],
+          holdModifier: payload[3],
+          holdKeycode: payload[4],
+          longPressMs: view.getUint16(6, true),
+        };
+      }
+
+      async function loadConfig() {
+        setStatus("正在读取配置...");
+        const payload = await sendCommand(CMD_GET);
+        const config = decodeConfig(payload);
+        writeConfigUi(config);
+        setDirty(false);
+        setStatus("已读取设备配置。", "ok");
+      }
+
+      async function saveConfig() {
+        const config = readConfigUi();
+        setStatus("正在保存配置...");
+        const payload = await sendCommand(CMD_SET, encodeConfig(config));
+        const saved = decodeConfig(payload);
+        writeConfigUi(saved);
+        setDirty(false);
+        setStatus("配置已保存。", "ok");
+      }
+
+      async function resetConfig() {
+        if (!window.confirm("恢复 VoxStick 默认配置？")) {
+          return;
+        }
+        setStatus("正在恢复默认配置...");
+        const payload = await sendCommand(CMD_RESET);
+        const config = decodeConfig(payload);
+        writeConfigUi(config);
+        setDirty(false);
+        setStatus("已恢复默认配置。", "ok");
+      }
+
+      async function connectDevice() {
+        if (!("usb" in navigator)) {
+          throw new Error("当前浏览器不支持 WebUSB。");
+        }
+        setStatus("正在连接...");
+        const device = await navigator.usb.requestDevice({
+          filters: [{ vendorId: VOX_VID, productId: VOX_PID }],
+        });
+        await device.open();
+        if (device.configuration === null) {
+          await device.selectConfiguration(1);
+        }
+        const endpoints = findVendorInterface(device.configuration);
+        await device.claimInterface(endpoints.interfaceNumber);
+        if (endpoints.alternateSetting !== 0) {
+          await device.selectAlternateInterface(
+            endpoints.interfaceNumber,
+            endpoints.alternateSetting,
+          );
+        }
+        state.device = device;
+        state.interfaceNumber = endpoints.interfaceNumber;
+        state.inEndpoint = endpoints.inEndpoint;
+        state.outEndpoint = endpoints.outEndpoint;
+        setConnected(true);
+        await loadConfig();
+      }
+
+      function handleUiChange(event) {
+        if (event && event.target.id === "tapPreset") {
+          applyPreset("tap");
+        }
+        if (event && event.target.id === "holdPreset") {
+          applyPreset("hold");
+        }
+        updateSummary();
+        if (state.connected) {
+          setDirty(true);
+        }
+      }
+
+      function init() {
+        populateModifiers("tapModifiers");
+        populateModifiers("holdModifiers");
+        populateKeys("tapKey", false);
+        populateKeys("holdKey", true);
+        writeConfigUi(DEFAULT_CONFIG);
+        setConnected(false);
+
+        $("connectBtn").addEventListener("click", async () => {
+          try {
+            await connectDevice();
+          } catch (error) {
+            setConnected(false);
+            setStatus(error.message || String(error), "error");
+          }
+        });
+
+        $("saveBtn").addEventListener("click", async () => {
+          try {
+            await saveConfig();
+          } catch (error) {
+            setStatus(error.message || String(error), "error");
+          }
+        });
+
+        $("reloadBtn").addEventListener("click", async () => {
+          try {
+            await loadConfig();
+          } catch (error) {
+            setStatus(error.message || String(error), "error");
+          }
+        });
+
+        $("resetBtn").addEventListener("click", async () => {
+          try {
+            await resetConfig();
+          } catch (error) {
+            setStatus(error.message || String(error), "error");
+          }
+        });
+
+        $("configFieldset").addEventListener("input", handleUiChange);
+        $("configFieldset").addEventListener("change", handleUiChange);
+
+        if ("usb" in navigator) {
+          navigator.usb.addEventListener("disconnect", (event) => {
+            if (state.device && event.device === state.device) {
+              state.device = null;
+              state.interfaceNumber = null;
+              state.inEndpoint = null;
+              state.outEndpoint = null;
+              setConnected(false);
+              setStatus("VoxStick 已断开。", "warn");
+            }
+          });
+          setStatus("连接后会自动读取当前配置。");
+        } else {
+          setStatus("当前浏览器不支持 WebUSB，请使用桌面版 Chrome 或 Microsoft Edge。", "error");
+        }
+      }
+
+      init();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,30 @@
+# voxstick — sdkconfig defaults for ESP32-S3 USB UAC.
+
+# --- Target ---------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- USB UAC (espressif/usb_device_uac 1.2.x) ----------------------------
+# Mic-only: speaker channels = 0 disables host-to-device output stream.
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=0
+CONFIG_UAC_MIC_CHANNEL_NUM=1
+CONFIG_UAC_SAMPLE_RATE=16000
+# atomic14 found this is the magic switch for macOS to actually pick up the
+# mic stream. It breaks Windows enumeration, but we are mac-first.
+CONFIG_UAC_SUPPORT_MACOS=y
+# Composite UAC + HID — main/ provides tusb_config.h and usb_descriptors.c.
+CONFIG_USB_DEVICE_UAC_AS_PART=y
+
+# USB device strings live in main/usb_descriptors.c now — AS_PART hides
+# the CONFIG_UAC_TUSB_* knobs.
+
+# --- 8 MB OPI PSRAM (StickS3) --------------------------------------------
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# --- Flash ----------------------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# --- Console: keep USB-Serial/JTAG for logs (separate from UAC USB IF) ---
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
