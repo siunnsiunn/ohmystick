@@ -71,6 +71,8 @@ Stick 到主機：
 ## hook 行為細節
 
 - 摘要在主機端先處理：遮蔽 `sk-`、`ghp_` 開頭的金鑰、`Bearer` 權杖、`token=`／`password=`／`api_key=` 之後的值；移除控制字元；超過 110 字截斷。
+- 遮蔽只處理「像金鑰的字元」（英數與 `. _ ~ + / = -`），`$ ( ) ; | & > <` 與反引號永遠不遮，避免把可執行內容藏起來。
+- **只要顯示內容與實際指令不同（有遮蔽或截斷），一律視為危險，需長按確認**；請求裡帶 `redacted:true` 讓螢幕標示。
 - 危險判斷（Bash）：`rm`、`sudo`、`dd`、`chmod`、`chown`、`kill`、`launchctl`、`git push|reset|clean|checkout --|branch -D`、`wrangler deploy|delete|publish`、`curl|wget … | sh`、寫入 `/etc`、`/usr`、`/System`、`--force`、`-rf`。
 - 其他工具：Write／Edit 顯示檔案路徑；其餘顯示參數名稱，不顯示內容。
 

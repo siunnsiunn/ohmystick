@@ -34,16 +34,22 @@ case "$TOOL" in
   *)                  RAW="$(jq -rc '.tool_input // {} | keys | join(",")' <<<"$INPUT")" ;;
 esac
 
-# Redact obvious secrets, drop control characters, collapse whitespace.
-clean() {
+# Normalise for display: drop control characters, collapse whitespace.
+norm() { LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\n\t' '  ' | tr -s ' '; }
+# Redact obvious secrets. Values are limited to secret-looking characters so shell
+# metacharacters ($ ( ) backtick ; | & > <) are never hidden from the human.
+redact() {
   LC_ALL=C sed -E \
     -e 's/(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…[redacted]/g' \
     -e 's/(gh[pousr]_[A-Za-z0-9]{4})[A-Za-z0-9]+/\1…[redacted]/g' \
-    -e 's/([Bb]earer )[A-Za-z0-9._~+\/-]+/\1[redacted]/g' \
-    -e 's/((token|secret|password|passwd|api[_-]?key)=)[^ &]+/\1[redacted]/gi' \
-    | LC_ALL=C tr -d '\000-\010\013-\037\177' | tr '\n\t' '  ' | tr -s ' '
+    -e 's/([Bb]earer )[A-Za-z0-9._~+\/=-]+/\1[redacted]/g' \
+    -e 's/((token|secret|password|passwd|api[_-]?key)=)[A-Za-z0-9._~+\/=-]+/\1[redacted]/gi'
 }
-SUMMARY_FULL="$(printf '%s' "$RAW" | clean)"
+PLAIN="$(printf '%s' "$RAW" | norm)"
+SUMMARY_FULL="$(printf '%s' "$PLAIN" | redact)"
+# What the human sees differs from what will run: never approve with a short press.
+REDACTED=false
+[ "$SUMMARY_FULL" != "$PLAIN" ] && REDACTED=true
 TRUNC=false
 if [ "${#SUMMARY_FULL}" -gt "$MAXLEN" ]; then
   SUMMARY="${SUMMARY_FULL:0:$MAXLEN}"; TRUNC=true
@@ -60,11 +66,12 @@ if [ "$TOOL" = "Bash" ]; then
 fi
 # A summary we cannot show in full is treated as dangerous: never approve unseen text.
 [ "$TRUNC" = true ] && DANGER=true
+[ "$REDACTED" = true ] && DANGER=true
 
 ID="$(uuidgen 2>/dev/null || echo "$$-$RANDOM")"
 REQ="$(jq -nc --arg id "$ID" --arg tool "$TOOL" --arg s "$SUMMARY" \
-  --argjson danger "$DANGER" --argjson trunc "$TRUNC" --argjson ttl "$TIMEOUT" \
-  '{v:1,type:"ask",id:$id,tool:$tool,summary:$s,danger:$danger,truncated:$trunc,ttl:$ttl}')"
+  --argjson danger "$DANGER" --argjson trunc "$TRUNC" --argjson red "$REDACTED" --argjson ttl "$TIMEOUT" \
+  '{v:1,type:"ask",id:$id,tool:$tool,summary:$s,danger:$danger,truncated:$trunc,redacted:$red,ttl:$ttl}')"
 
 # ---- talk to the device ----------------------------------------------------
 [ -c "$RX" ] && stty -f "$RX" 115200 raw -echo 2>/dev/null

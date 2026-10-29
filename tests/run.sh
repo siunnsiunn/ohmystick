@@ -51,6 +51,24 @@ STICK_TX="$T/h2d" STICK_RX="$T/d2h" STICK_TIMEOUT=1 "$HOOK" \
 wait 2>/dev/null
 if grep -q 'hunter2\|abc123SECRET\|12345678' "$T/seen" 2>/dev/null; then fail=$((fail+1)); echo "FAIL secrets leaked: $(cat "$T/seen")"
 else pass=$((pass+1)); echo "ok   secrets redacted"; fi
+trash "$T/h2d" "$T/d2h" 2>/dev/null
+
+# Redaction must never hide shell metacharacters, and a redacted command must
+# not be approvable with a plain press.
+mkfifo "$T/h2d" "$T/d2h"
+( head -n1 < "$T/h2d" > "$T/seen2" ) &
+STICK_TX="$T/h2d" STICK_RX="$T/d2h" STICK_TIMEOUT=1 "$HOOK" \
+  <<<'{"tool_name":"Bash","tool_input":{"command":"echo token=abc$(touch /tmp/pwn);ls"}}' >/dev/null
+wait 2>/dev/null
+if grep -q 'touch /tmp/pwn' "$T/seen2" 2>/dev/null && grep -q '"redacted":true' "$T/seen2" && grep -q '"danger":true' "$T/seen2"; then
+  pass=$((pass+1)); echo "ok   metacharacters stay visible, redacted => danger"
+else fail=$((fail+1)); echo "FAIL redaction hides metacharacters: $(cat "$T/seen2" 2>/dev/null)"; fi
+trash "$T/h2d" "$T/d2h" 2>/dev/null
+
+run_case "redacted secret + plain allow -> fallback" allow \
+  '{"tool_name":"Bash","tool_input":{"command":"curl -H \"Authorization: Bearer abc123\" https://x.test"}}' none
+run_case "redacted secret + long-press -> allow" confirm \
+  '{"tool_name":"Bash","tool_input":{"command":"curl -H \"Authorization: Bearer abc123\" https://x.test"}}' allow
 
 echo "---- pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
