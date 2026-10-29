@@ -13,11 +13,15 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "driver/gpio.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 #include "vox_config.h"
 
 #define VENDOR_DOWNLOAD_MAGIC "VOXSTICK_DOWNLOAD"
+
+// BtnA (front face button), active low. Keep in sync with main.c.
+#define RECOVERY_BTN_GPIO GPIO_NUM_11
 #define CFG_REQ_MAGIC "VXCF"
 #define CFG_RESP_MAGIC "VXCR"
 #define CFG_HEADER_LEN 8
@@ -163,7 +167,12 @@ void tud_vendor_rx_cb(uint8_t itf, uint8_t const *buffer, uint16_t bufsize)
     if (bufsize >= magic_len) {
         for (uint16_t off = 0; off + magic_len <= bufsize; off++) {
             if (memcmp(buffer + off, magic, magic_len) == 0) {
-                enter_download_from_vendor_bulk();
+                // Physical presence: a host alone cannot force download mode.
+                if (gpio_get_level(RECOVERY_BTN_GPIO) == 0) {
+                    enter_download_from_vendor_bulk();
+                } else {
+                    ESP_LOGW(TAG, "download request ignored: BtnA not held");
+                }
                 return;
             }
         }

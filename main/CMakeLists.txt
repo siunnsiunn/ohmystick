@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS "main.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
+         "ble_presenter.c" "esp_hid_gap.c"
     PRIV_REQUIRES driver
                   esp_driver_i2c
                   esp_driver_spi
@@ -9,9 +10,13 @@ idf_component_register(
                   espressif2022__bmi270
                   espressif__i2c_bus
                   nvs_flash
+                  esp_hid
+                  bt
     INCLUDE_DIRS "."
 )
 
+option(VOX_ENABLE_BLE_PRESENTER
+       "Experimental: start BLE HID in presenter mode (off by default)" OFF)
 option(VOX_DEBUG_NO_UAC "Keep USB-Serial/JTAG alive by skipping UAC/HID init" OFF)
 option(VOX_DIAG_CODEC_FAIL_TONE
        "Diagnostic only: emit a tone over UAC when codec init fails" OFF)
@@ -29,6 +34,23 @@ if(VOX_DEBUG_NO_UAC AND
         "VOX_DEBUG_NO_UAC safety: auto-download after "
         "${VOX_DEBUG_NO_UAC_AUTO_DOWNLOAD_SEC}s")
     set(VOX_AUTO_DOWNLOAD_AFTER_SEC "${VOX_DEBUG_NO_UAC_AUTO_DOWNLOAD_SEC}")
+endif()
+
+set(VOX_BLE_VARIANT "" CACHE STRING "Overnight test variant number (empty = normal build)")
+set(VOX_BLE_JUST_WORKS "1" CACHE STRING "1 = Just Works, 0 = passkey on LCD")
+if(NOT VOX_BLE_VARIANT STREQUAL "")
+    math(EXPR VOX_BLE_PID_DEC "18944 + ${VOX_BLE_VARIANT}")   # 0x4A00 + n
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        VOX_BLE_VARIANT=${VOX_BLE_VARIANT}
+        VOX_BLE_PID=${VOX_BLE_PID_DEC}
+        "VOX_BLE_NAME=\"SS3-V${VOX_BLE_VARIANT}\"")
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE VOX_BLE_JUST_WORKS=${VOX_BLE_JUST_WORKS})
+
+if(VOX_ENABLE_BLE_PRESENTER)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE VOX_ENABLE_BLE_PRESENTER=1)
+else()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE VOX_ENABLE_BLE_PRESENTER=0)
 endif()
 
 if(VOX_DEBUG_NO_UAC)

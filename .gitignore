@@ -15,7 +15,6 @@ sdkconfig.*-bisect
 sdkconfig.before-*
 sdkconfig.minimal-*
 managed_components/
-dependencies.lock
 
 # macOS
 .DS_Store

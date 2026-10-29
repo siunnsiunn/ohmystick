@@ -21,6 +21,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
@@ -46,6 +47,7 @@
 #include "bmi270.h"
 #include "bmi2_defs.h"
 #include "vox_config.h"
+#include "ble_presenter.h"
 
 // Set to 1 to skip TinyUSB / UAC init - keeps USB-Serial/JTAG console
 // alive on /dev/cu.usbmodem* so we can read ESP_LOG output. Diagnostic
@@ -90,6 +92,9 @@ static const char *TAG = "voxstick";
 // StickS3 face button. BtnA = front, big M5 logo. BtnB header is unpopulated
 // on this hardware revision so we don't bother polling it.
 #define BTN_A_GPIO    GPIO_NUM_11
+// Side button (KEY2 per M5 docs, G12). Used only in presenter mode: previous
+// slide. Ignored in dictation mode so a stray press can never type anything.
+#define BTN_B_GPIO    GPIO_NUM_12
 
 // ---- LCD (ST7789P3 135x240, SPI3) ---------------------------------------
 // Numbers from the M5StickS3 datasheet / weclawbot-base reference.
@@ -173,9 +178,13 @@ static volatile bool            g_vad_display_enabled = false;
 // and g_codec_ready (codec init failure).
 static volatile bool            g_imu_mute  = false;
 
+// Presenter mode: button sends slide keys and the mic is forced silent.
+// Always false at boot; toggled only by a very long press (see button_task).
+static volatile bool            g_presenter_mode = false;
+
 static bool effective_mic_muted(void)
 {
-    return g_uac_muted || (vox_config_flat_mute_enabled() && g_imu_mute);
+    return g_presenter_mode || g_uac_muted || (vox_config_flat_mute_enabled() && g_imu_mute);
 }
 
 // =========================================================================
@@ -401,6 +410,65 @@ static void lcd_draw_mic_status(uint32_t level, bool active,
     }
 }
 
+// Presenter screen: orange right-arrow on black. Mic is muted in this mode.
+static volatile bool g_presenter_redraw = false;
+static volatile TickType_t g_passkey_hold_until = 0;   // keep passkey on screen
+// Presenter-screen draws come from two tasks (LCD task, NimBLE host task).
+static StaticSemaphore_t g_pres_lcd_mu_buf;
+static SemaphoreHandle_t g_pres_lcd_mu = NULL;
+static void lcd_draw_digit(int x, int y, int d, uint16_t col);
+
+static void lcd_draw_presenter(void)
+{
+    if (!g_lcd) return;
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    const int cx = LCD_W / 2;
+    // Orange = USB keys; cyan = BLE link up.
+    uint16_t col = ble_presenter_connected() ? COL_CYAN : COL_ORANGE;
+    lcd_fill_rect(0, 34, LCD_W, 184, COL_BLACK);
+    lcd_draw_thick_line(cx - 36, 109, cx + 30, 109, 8, col);
+    lcd_draw_thick_line(cx + 34, 109, cx + 6, 80, 8, col);
+    lcd_draw_thick_line(cx + 34, 109, cx + 6, 138, 8, col);
+    // BLE bring-up state (digits): 6 = advertising, 9x = init failure at step x.
+    int st = ble_presenter_state();
+    uint16_t sc = st >= 90 ? COL_RED : (st == 6 ? COL_GREEN : COL_YELLOW);
+#ifdef VOX_BLE_VARIANT
+    lcd_draw_digit(LCD_W - 26, 44, VOX_BLE_VARIANT, COL_WHITE);   // which test variant
+#endif
+    if (st >= 10) lcd_draw_digit(10, 44, st / 10, sc);
+    lcd_draw_digit(st >= 10 ? 34 : 10, 44, st % 10, sc);
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
+// 7-segment digits for the BLE pairing passkey (random per pairing).
+static void lcd_draw_digit(int x, int y, int d, uint16_t col)
+{
+    static const uint8_t seg[10] = {0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
+    const int w = 16, h = 30, k = 3;
+    uint8_t s = seg[d];
+    if (s & 0x01) lcd_fill_rect(x, y, x + w, y + k, col);
+    if (s & 0x02) lcd_fill_rect(x + w - k, y, x + w, y + h / 2, col);
+    if (s & 0x04) lcd_fill_rect(x + w - k, y + h / 2, x + w, y + h, col);
+    if (s & 0x08) lcd_fill_rect(x, y + h - k, x + w, y + h, col);
+    if (s & 0x10) lcd_fill_rect(x, y + h / 2, x + k, y + h, col);
+    if (s & 0x20) lcd_fill_rect(x, y, x + k, y + h / 2, col);
+    if (s & 0x40) lcd_fill_rect(x, y + h / 2 - 1, x + w, y + h / 2 + 2, col);
+}
+
+void ble_presenter_show_passkey(uint32_t passkey)
+{
+    if (!g_lcd) return;
+    // Hold flag first so the LCD task stops repainting before we draw.
+    g_passkey_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_fill_rect(0, 34, LCD_W, 184, COL_BLACK);
+    for (int i = 5; i >= 0; i--) {
+        lcd_draw_digit(4 + i * 21, 95, passkey % 10, COL_YELLOW);
+        passkey /= 10;
+    }
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
 static void vad_lcd_task(void *arg)
 {
     (void)arg;
@@ -410,9 +478,47 @@ static void vad_lcd_task(void *arg)
     bool last_codec_ready = false;
     bool last_muted = false;
     uint32_t last_bucket = UINT32_MAX;
+    bool last_presenter = false;
+    bool last_ble_up = false;
+    int  last_ble_st = 0;
 
     while (1) {
         if (!g_vad_display_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
+            continue;
+        }
+
+        bool presenter = g_presenter_mode;
+        // Pairing in progress: leave the passkey up until encryption succeeds
+        // (state 61), fails (98) or 60 s pass.
+        if (presenter && g_passkey_hold_until != 0) {
+            int s = ble_presenter_state();
+            bool expired = (int32_t)(xTaskGetTickCount() - g_passkey_hold_until) >= 0;
+            if (s == 61 || s == 98 || expired) {
+                g_passkey_hold_until = 0;
+                last_presenter = false;   // repaint arrow
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
+                continue;
+            }
+        }
+        bool ble_up = ble_presenter_connected();
+        int ble_st = ble_presenter_state();
+        if (presenter && (ble_up != last_ble_up || ble_st != last_ble_st)) {
+            last_ble_up = ble_up;
+            last_ble_st = ble_st;
+            last_presenter = false;   // repaint arrow in the new colour
+        }
+        if (presenter != last_presenter) {
+            last_presenter = presenter;
+            if (presenter) {
+                lcd_draw_presenter();
+            } else {
+                // Force a mic-screen redraw on the next pass.
+                last_bucket = UINT32_MAX;
+            }
+        }
+        if (presenter) {
             vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
             continue;
         }
@@ -463,6 +569,13 @@ static void download_task(void *arg)
     }
     enter_rom_download_mode(g_download_reason);
     vTaskDelete(NULL);
+}
+
+// Host-initiated ROM download (vendor request / HID LED magic) is only honoured
+// while BtnA is physically held, so a host process alone cannot force a reflash.
+static bool host_download_allowed(void)
+{
+    return gpio_get_level(BTN_A_GPIO) == 0;
 }
 
 static void request_rom_download(const char *reason, uint32_t delay_ms)
@@ -1110,6 +1223,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
 
     if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
         request->bRequest == VENDOR_DOWNLOAD_REQUEST) {
+        if (!host_download_allowed()) {
+            ESP_LOGW(TAG, "vendor download request ignored: BtnA not held");
+            return false;
+        }
         ESP_LOGW(TAG, "USB vendor download magic");
         request_rom_download("USB vendor magic requested ROM download", 150);
         return tud_control_status(rhport, request);
@@ -1129,6 +1246,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
 // 10 ms tick) before we commit it. Stops jitter from re-triggering PTT.
 // =========================================================================
 #define BTN_POLL_MS         10
+// Hold this long (no HID sent) to switch dictation <-> presenter mode.
+#define MODE_TOGGLE_MS      2500
+#define HID_KEY_RIGHT_ARROW 0x4F
+#define HID_KEY_LEFT_ARROW  0x50
 #define BTN_DEBOUNCE_TICKS  2
 
 #define HID_REPORT_ID_KBD   1
@@ -1183,7 +1304,11 @@ void voxstick_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                  magic_seen, HID_DOWNLOAD_MAGIC_REPEATS);
         if (magic_seen >= HID_DOWNLOAD_MAGIC_REPEATS) {
             magic_seen = 0;
-            request_rom_download("HID LED magic requested ROM download", 150);
+            if (host_download_allowed()) {
+                request_rom_download("HID LED magic requested ROM download", 150);
+            } else {
+                ESP_LOGW(TAG, "HID LED download magic ignored: BtnA not held");
+            }
         }
     } else {
         magic_seen = 0;
@@ -1194,7 +1319,7 @@ void voxstick_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 static void buttons_init(void)
 {
     gpio_config_t cfg = {
-        .pin_bit_mask  = (1ULL << BTN_A_GPIO),
+        .pin_bit_mask  = (1ULL << BTN_A_GPIO) | (1ULL << BTN_B_GPIO),
         .mode          = GPIO_MODE_INPUT,
         .pull_up_en    = GPIO_PULLUP_ENABLE,
         .pull_down_en  = GPIO_PULLDOWN_DISABLE,
@@ -1249,10 +1374,28 @@ static void button_task(void *arg)
     int  a_stable    = 0;
     TickType_t a_press_start = 0;
     vox_config_wire_t a_press_cfg = {0};
+    bool       continue_after_toggle = false;  // mode switch sends no key
     bool       a_long_latched = false;  // true once the press has crossed
                                         // the long threshold this hold
 
+    bool b_committed = true;     // released = high
+    bool b_pending   = true;
+    int  b_stable    = 0;
+
     while (1) {
+        bool b = gpio_get_level(BTN_B_GPIO);
+        if (b != b_pending) { b_pending = b; b_stable = 0; }
+        else if (b_stable < BTN_DEBOUNCE_TICKS) { b_stable++; }
+        else if (b_pending != b_committed) {
+            b_committed = b_pending;
+            if (!b_committed && g_presenter_mode) {
+                ESP_LOGI(TAG, "btn B down (prev slide)");
+                if (!ble_presenter_send_key(HID_KEY_LEFT_ARROW)) {
+                    hid_send_tap(0, HID_KEY_LEFT_ARROW);
+                }
+            }
+        }
+
         bool a = gpio_get_level(BTN_A_GPIO);
 
         if (a != a_pending) { a_pending = a; a_stable = 0; }
@@ -1270,16 +1413,40 @@ static void button_task(void *arg)
                 // Just released — fire the right tap.
                 TickType_t held = xTaskGetTickCount() - a_press_start;
                 bool is_long = pdTICKS_TO_MS(held) >= a_press_cfg.long_press_ms;
+                if (pdTICKS_TO_MS(held) >= MODE_TOGGLE_MS) {
+                    g_presenter_mode = !g_presenter_mode;
+                    ESP_LOGW(TAG, "mode -> %s",
+                             g_presenter_mode ? "presenter" : "dictation");
+                    if (g_presenter_mode) {
+                        ble_presenter_start_async();   // radio on only here
+                    }
+                    if (!g_vad_display_enabled) {
+                        lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
+                    }
+                    continue_after_toggle = true;
+                }
                 uint8_t modifier = is_long ?
                     a_press_cfg.hold_modifier : a_press_cfg.tap_modifier;
                 uint8_t keycode = is_long ?
                     a_press_cfg.hold_keycode : a_press_cfg.tap_keycode;
+                if (g_presenter_mode) {
+                    modifier = 0;
+                    keycode = is_long ? HID_KEY_LEFT_ARROW : HID_KEY_RIGHT_ARROW;
+                }
                 ESP_LOGI(TAG, "btn A up after %lu ms (%s 0x%02x+0x%02x)",
                          (unsigned long)pdTICKS_TO_MS(held),
                          is_long ? "long" : "tap",
                          modifier,
                          keycode);
-                hid_send_tap(modifier, keycode);
+                if (!continue_after_toggle) {
+                    if (g_presenter_mode &&
+                        ble_presenter_send_key(keycode)) {
+                        /* sent over BLE; skip USB to avoid double advance */
+                    } else {
+                        hid_send_tap(modifier, keycode);
+                    }
+                }
+                continue_after_toggle = false;
                 if (!g_vad_display_enabled) {
                     lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
                 }
@@ -1375,7 +1542,7 @@ void app_main(void)
 #endif
 
     buttons_init();
-    xTaskCreate(button_task, "btn", 2048, NULL, 5, NULL);
+    xTaskCreate(button_task, "btn", 4096, NULL, 5, NULL);
     ESP_LOGI(TAG, "buttons up (BtnA=GPIO%d)", BTN_A_GPIO);
 
     // BMI270 IMU for orientation-based mic auto-mute. Best-effort: if init
@@ -1389,6 +1556,7 @@ void app_main(void)
 
 #if !VOX_DEBUG_NO_UAC
     lcd_draw_mic_status(0, false, g_codec_ready, effective_mic_muted());
+    g_pres_lcd_mu = xSemaphoreCreateMutexStatic(&g_pres_lcd_mu_buf);
     xTaskCreate(vad_lcd_task, "vad_lcd", 3072, NULL, 4, NULL);
 #endif
 
