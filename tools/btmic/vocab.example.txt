@@ -1,0 +1,8 @@
+# Copy to ~/.btmic-vocab.txt. One word or short phrase per line; they are joined into one sentence
+# and given to the recogniser as a hint. Put abbreviations in the capitalisation you want
+# ("CBC", not "cbc"), plus the phrases you really say. Keep the whole file short (about 10 lines):
+# a long list makes the model repeat it.
+CBC、BUN、creatinine、SDMA
+肝指數 ALT 升高
+cPLI 異常，懷疑胰臟炎
+Meloxicam 0.1 毫克每公斤，每天一次

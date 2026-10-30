@@ -19,6 +19,7 @@ dims after 15 s and turns off after 30 s.
 | WHISPER | Hold the front button and talk; the stick streams audio over BLE to a small Mac helper, **local** Whisper transcribes it, and the text is pasted at the cursor |
 | NOTE | Same, but works with no Mac in reach: recordings are stored in the stick's flash (12 slots, 30 s each) and upload automatically when you return to NOTE with the helper running; text goes to `~/btmic-inbox.md` |
 | SLIDE | Bluetooth slide clicker |
+| DIAG | Status screen: link, pending notes, battery, memory, and why the stick last reset itself |
 
 WHISPER and NOTE need the Mac helper in `tools/btmic/` (Swift plus
 `mlx_whisper`, Apple Silicon). Audio never leaves your machine: no network
@@ -26,9 +27,13 @@ requests, no cloud ASR. Details, protocol and pitfalls are in
 [`docs/BT-MIC.md`](docs/BT-MIC.md) (written in Traditional Chinese).
 
 ```
-tools/btmic/build.sh     # build out/btmic.app
-tools/btmic/run.sh       # start the receiver (log: ~/.btmic.log)
+tools/btmic/build.sh           # build out/btmic.app
+tools/btmic/install-agent.sh   # run at login, restart on crash (or run.sh to start by hand)
 ```
+
+The helper transcribes with Breeze-ASR-25 (`mlx_whisper`). A vocabulary file
+`~/.btmic-vocab.txt` (see `tools/btmic/vocab.example.txt`) helps with drug names
+and abbreviations.
 
 First run needs Bluetooth and Accessibility permission for `btmic.app`;
 the Accessibility grant must be re-added after every rebuild.

@@ -166,7 +166,7 @@ void inbox_delete(int slot)
     s_erase_pos[slot] = 1;                       // header sector already erased
 }
 
-// Housekeeping target: keep two erased slots ready (all dirty ones eventually).
+// Housekeeping target: keep three erased slots ready (all dirty ones eventually).
 bool inbox_maintain_needed(void)
 {
     if (!s_part || s_cur >= 0) return false;
@@ -175,7 +175,7 @@ bool inbox_maintain_needed(void)
         if (s_state[i] == S_CLEAN) clean++;
         else if (s_state[i] == S_DIRTY) dirty++;
     }
-    return dirty > 0 && clean < 2;
+    return dirty > 0 && clean < 3;
 }
 
 static bool sector_blank(size_t off)

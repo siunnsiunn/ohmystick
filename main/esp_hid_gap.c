@@ -896,12 +896,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        MODLOG_DFLT(INFO, "notify_tx event; conn_handle=%d attr_handle=%d "
-                "status=%d is_indication=%d",
-                event->notify_tx.conn_handle,
-                event->notify_tx.attr_handle,
-                event->notify_tx.status,
-                event->notify_tx.indication);
+        /* One event per notification (about 100 a second while uploading): not logged. */
         return 0;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING:

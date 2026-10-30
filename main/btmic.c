@@ -1,4 +1,5 @@
 #include "btmic.h"
+#include "esp_random.h"
 #include "inbox.h"
 
 #include <string.h>
@@ -39,7 +40,7 @@ static const ble_uuid128_t k_ctrl_uuid  = VOX_UUID(0x02);
 #define BUSY_HOLD_MS      60000                    // BUSY lasts until DONE/ERR (or this)
 
 enum { TYPE_AUDIO = 1, TYPE_END = 2, TYPE_START = 3 };
-enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3, CTRL_FULL = 4 /* local only */, CTRL_PING = 5 };
+enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3, CTRL_FULL = 4 /* local only */, CTRL_PING = 5, CTRL_RETRY = 6 /* Mac: stored recording incomplete, send again */ };
 #define PEER_ALIVE_MS     6000                     // no heartbeat for this long = no Mac listening
 #define FLAG_OFFLINE      0x01                     // frame header byte 7: stored recording
 
@@ -59,6 +60,15 @@ static volatile bool     s_rec_offline = false;
 static volatile bool     s_ping_seen = false;      // heartbeat from the Mac helper
 static volatile TickType_t s_last_ping = 0;
 static volatile uint16_t s_ctrl_session = 0;       // session the last DONE/ERR/BUSY refers to (0 = unknown)
+static volatile uint16_t s_retry_sess = 0;         // Mac asked for this session to be sent again
+static volatile bool     s_retry_flag = false;
+// A stored recording that has been sent and is waiting for the Mac's DONE. It is
+// tracked in the background so recording or leaving the screen never loses the answer.
+static int               s_ack_slot = -1;
+static uint16_t          s_ack_sess = 0;
+static TickType_t        s_ack_until = 0;
+static TickType_t        s_ack_start = 0;
+#define ACK_MAX_MS        900000                   // give up on one recording after 15 min of BUSY
 #define ACK_WAIT_MS       90000                    // Mac needs this long at most per recording
 
 // ---- IMA ADPCM -------------------------------------------------------------
@@ -119,6 +129,11 @@ static int ctrl_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
         s_ping_seen = true;
         return 0;
     }
+    if (b == CTRL_RETRY) {
+        s_retry_sess = sess;
+        s_retry_flag = true;
+        return 0;
+    }
     if (b == CTRL_BUSY || b == CTRL_DONE || b == CTRL_ERR) {
         s_ctrl_session = sess;
         s_ctrl_status = b;
@@ -171,7 +186,7 @@ void btmic_on_disconnect(void)
     s_link_ok = false;
     s_sub = false;
     s_ping_seen = false;
-    s_recording = false;
+    if (!s_rec_offline) s_recording = false;       // a recording to flash does not need the link
     s_conn = BLE_HS_CONN_HANDLE_NONE;
 }
 
@@ -195,9 +210,11 @@ static bool link_ready(void)   { return s_link_ok; }
 
 // Live audio gives up quickly (late audio is useless); stored recordings keep
 // retrying so nothing is lost when the radio buffers are momentarily full.
-static bool send_frame_n(const uint8_t *f, size_t n, int max_tries)
+static bool send_frame_n(const uint8_t *f, size_t n, int max_tries, bool abortable)
 {
     for (int tries = 0; tries < max_tries; tries++) {
+        // Uploads of stored recordings step aside for a new recording or a screen change.
+        if (abortable && (s_recording || !s_sync_ok)) return false;
         struct os_mbuf *om = ble_hs_mbuf_from_flat(f, n);
         if (!om) { vTaskDelay(1)    /* one tick: 5 ms rounds to 0 at 100 Hz, which spins */; continue; }
         vox_crumb = 34;
@@ -211,8 +228,8 @@ static bool send_frame_n(const uint8_t *f, size_t n, int max_tries)
     return false;
 }
 
-static bool send_frame(const uint8_t *f, size_t n)        { return send_frame_n(f, n, 4); }
-static bool send_frame_stored(const uint8_t *f, size_t n) { return send_frame_n(f, n, 400); }   // up to ~2 s
+static bool send_frame(const uint8_t *f, size_t n)        { return send_frame_n(f, n, 4, false); }
+static bool send_frame_stored(const uint8_t *f, size_t n) { return send_frame_n(f, n, 400, true); }   // 400 ticks = up to ~4 s
 
 static void fill_header(uint8_t *f, uint8_t type, uint16_t seq, int pred, int idx, uint8_t flags)
 {
@@ -238,6 +255,13 @@ static void send_end(uint8_t *frame, uint16_t seq, uint8_t flags)
     }
 }
 
+// Random start so a reply meant for a session before a reboot cannot match; 0 means "unknown".
+static uint16_t next_session(void)
+{
+    uint16_t s = s_session + 1;
+    return s ? s : 1;
+}
+
 static void record_session(void)
 {
     vox_crumb = 10;
@@ -252,7 +276,7 @@ static void record_session(void)
     if (off) {
         if (!inbox_begin()) { s_recording = false; return; }
     } else {
-        s_session++;
+        s_session = next_session();
         fill_header(frame, TYPE_START, seq++, 0, 0, flags);
         if (!send_frame(frame, HEADER_LEN)) dropped++;
     }
@@ -302,6 +326,7 @@ static void sync_fail(uint8_t reason)
 
 static void sync_step(void)
 {
+    if (s_ack_slot >= 0) return;                       // sent already, waiting for the Mac
     if (!s_sync_ok || s_recording || !link_ready() || inbox_pending() == 0) { s_syncing = false; return; }
     if ((int32_t)(xTaskGetTickCount() - s_sync_retry_at) < 0) return;
     if (s_ctrl_status == CTRL_BUSY && (int32_t)(xTaskGetTickCount() - s_ctrl_until) < 0) return;   // Mac is busy
@@ -312,7 +337,7 @@ static void sync_step(void)
     vox_crumb = 30;
     s_syncing = true;
     s_sync_tries++;
-    s_session++;
+    s_session = next_session();
     s_ctrl_status = 0;
     s_ctrl_session = 0;
     uint16_t seq = 0;
@@ -327,32 +352,48 @@ static void sync_step(void)
         if (!inbox_read(slot, i, &pred, &idx, frame + HEADER_LEN)) { sync_fail(1); return; }
         fill_header(frame, TYPE_AUDIO, seq++, pred, idx, FLAG_OFFLINE);
         if (!send_frame_stored(frame, FRAME_LEN)) { sync_fail(2); return; }   // link trouble: keep it queued
-        vTaskDelay(pdMS_TO_TICKS(15));           // a little faster than real time
+        vTaskDelay(1);                           // one tick (10 ms): about twice real time
     }
     vox_crumb = 31;
+    // Forget older replies first: only an answer that comes after the end frame counts.
+    s_ctrl_status = 0;
+    s_ctrl_session = 0;
+    s_retry_flag = false;
     send_end(frame, seq, FLAG_OFFLINE);
+    s_ack_slot = slot;
+    s_ack_sess = s_session;
+    s_ack_start = xTaskGetTickCount();
+    s_ack_until = s_ack_start + pdMS_TO_TICKS(ACK_WAIT_MS);
+}
 
-    TickType_t until = xTaskGetTickCount() + pdMS_TO_TICKS(ACK_WAIT_MS);
-    uint8_t why = 6;
-    while ((int32_t)(xTaskGetTickCount() - until) < 0) {
-        // Only an answer for this very session counts; anything else (a live
-        // result, an old reply) must not delete a recording the Mac never got.
-        if ((s_ctrl_status == CTRL_DONE || s_ctrl_status == CTRL_ERR) && s_ctrl_session == s_session) {
-            vox_crumb = 32;
-            inbox_delete(slot);
-            ESP_LOGI(TAG, "slot %d uploaded", slot);
-            s_syncing = false;
-            s_sync_reason = 5;
-            return;
-        }
-        vox_hb_rec++;
-        link_refresh();
-        if (s_recording) { why = 4; break; }
-        if (!s_sync_ok) { why = 7; break; }
-        if (!link_ready()) { why = 3; break; }
-        vTaskDelay(pdMS_TO_TICKS(100));
+// Called every round of the task: settles the recording that is waiting for the Mac.
+static void ack_service(void)
+{
+    if (s_ack_slot < 0) return;
+    TickType_t now = xTaskGetTickCount();
+    uint8_t why = 0;
+    if (s_ctrl_session == s_ack_sess && s_ctrl_status == CTRL_DONE) {
+        vox_crumb = 32;
+        inbox_delete(s_ack_slot);
+        ESP_LOGI(TAG, "slot %d uploaded", s_ack_slot);
+        s_ack_slot = -1;
+        s_syncing = false;
+        s_sync_reason = 5;
+        return;
     }
-    sync_fail(why);
+    if (s_retry_flag && s_retry_sess == s_ack_sess) why = 8;                       // Mac got only part of it
+    else if (s_ctrl_session == s_ack_sess && s_ctrl_status == CTRL_BUSY &&
+             (int32_t)(now - s_ack_start) < (int32_t)pdMS_TO_TICKS(ACK_MAX_MS)) {
+        TickType_t ext = now + pdMS_TO_TICKS(30000);                               // Mac is still working on it
+        if ((int32_t)(ext - s_ack_until) > 0) s_ack_until = ext;
+    }
+    if (!why && (int32_t)(now - s_ack_until) >= 0) why = 6;
+    if (!why && !link_ready()) why = 3;
+    if (why) {
+        s_ack_slot = -1;
+        s_retry_flag = false;
+        sync_fail(why);
+    }
 }
 
 static void rec_task(void *arg)
@@ -361,6 +402,7 @@ static void rec_task(void *arg)
     for (;;) {
         vox_hb_rec++;
         link_refresh();
+        ack_service();
         // Short idle tick while there is erasing to do or a Mac to talk to, slow otherwise.
         TickType_t wait = (s_maint_ok && inbox_maintain_needed()) ? pdMS_TO_TICKS(60) : pdMS_TO_TICKS(1000);
         if (s_sub && wait > pdMS_TO_TICKS(200)) wait = pdMS_TO_TICKS(200);
@@ -377,6 +419,7 @@ static void rec_task(void *arg)
 void btmic_init(btmic_read_fn reader)
 {
     s_reader = reader;
+    s_session = (uint16_t)esp_random();
     inbox_init();
     if (!s_task) xTaskCreate(rec_task, "btmic", 6144, NULL, 5, &s_task);
 }

@@ -84,6 +84,7 @@ func makeFrame(type: FrameType, session: UInt16, seq: UInt16,
     return f
 }
 
+let maxSamples = 16000 * 70
 let flagOffline: UInt8 = 0x01     // frame byte 7: a recording stored on the stick
 
 struct ParsedFrame {
@@ -158,20 +159,52 @@ func writeWav16kMono(_ pcm: [Int16], to url: URL) throws {
 
 // MARK: - Whisper + paste
 
+/// Words and short phrases the recogniser should get right (abbreviations with
+/// their capitalisation, drug names, usual clinical phrases), one per line in
+/// ~/.btmic-vocab.txt. They are joined into a plain sentence: a bare word list
+/// is the weakest kind of prompt, and a long one makes the model parrot it back.
+func vocabularyPrompt() -> String? {
+    guard let raw = try? String(contentsOfFile: NSHomeDirectory() + "/.btmic-vocab.txt", encoding: .utf8) else { return nil }
+    let lines = raw.split(separator: "\n")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+    guard !lines.isEmpty else { return nil }
+    return String((lines.joined(separator: "，") + "。").prefix(300))
+}
+
 func transcribe(wav: URL, language: String, model: String) throws -> String {
     let outDir = wav.deletingLastPathComponent()
+    let env0 = ProcessInfo.processInfo.environment
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = ["mlx_whisper", wav.path, "--model", model, "--language", language,
-                   "--output-format", "txt", "--output-dir", outDir.path]
-    var env = ProcessInfo.processInfo.environment
+    var args = ["mlx_whisper", wav.path, "--model", model, "--language", language,
+                "--output-format", "txt", "--output-dir", outDir.path,
+                // a repeated prompt word can otherwise snowball into a loop
+                "--condition-on-previous-text", "False"]
+    // "=" form: a vocabulary line that starts with "-" must not be read as an option
+    if let vocab = vocabularyPrompt() { args.append("--initial-prompt=\(vocab)") }
+    p.arguments = args
+    var env = env0
     env["PATH"] = "\(NSHomeDirectory())/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
+    // The model is cached locally; without this every run still asks Hugging Face for updates.
+    if env0["BTMIC_ONLINE"] != "1" { env["HF_HUB_OFFLINE"] = "1" }
     p.environment = env
     p.standardOutput = FileHandle.nullDevice
-    let err = Pipe(); p.standardError = err
-    try p.run(); p.waitUntilExit()
+    // A file, not a pipe: a pipe that nobody drains blocks the child once it is full.
+    let errURL = outDir.appendingPathComponent("stderr.txt")
+    FileManager.default.createFile(atPath: errURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    p.standardError = try FileHandle(forWritingTo: errURL)
+    let exited = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in exited.signal() }
+    try p.run()
+    let limit = Double(env0["BTMIC_TIMEOUT"] ?? "") ?? 180
+    if exited.wait(timeout: .now() + limit) == .timedOut {
+        p.terminate()
+        if exited.wait(timeout: .now() + 5) == .timedOut { kill(p.processIdentifier, SIGKILL); _ = exited.wait(timeout: .now() + 5) }
+        throw NSError(domain: "btmic", code: 5, userInfo: [NSLocalizedDescriptionKey: "mlx_whisper timed out after \(Int(limit)) s"])
+    }
     guard p.terminationStatus == 0 else {
-        let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let msg = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
         throw NSError(domain: "btmic", code: 4, userInfo: [NSLocalizedDescriptionKey: "mlx_whisper failed: \(msg.suffix(300))"])
     }
     let txt = outDir.appendingPathComponent(wav.deletingPathExtension().lastPathComponent + ".txt")
@@ -180,16 +213,26 @@ func transcribe(wav: URL, language: String, model: String) throws -> String {
 
 /// Appends a transcript of a recording made while the Mac was out of reach to
 /// ~/btmic-inbox.md. The time is when it reached the Mac, not when it was spoken.
-func saveToInbox(_ text: String) {
+func saveToInbox(_ text: String) -> Bool {
     let path = NSHomeDirectory() + "/btmic-inbox.md"
     let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"
-    let entry = "## \(f.string(from: Date())) (offline recording)\n\n\(text)\n\n"
-    if let h = FileHandle(forWritingAtPath: path) {
-        h.seekToEndOfFile(); h.write(Data(entry.utf8)); try? h.close()
-    } else {
-        FileManager.default.createFile(atPath: path, contents: Data(entry.utf8), attributes: [.posixPermissions: 0o600])
+    let entry = Data("## \(f.string(from: Date())) (offline recording)\n\n\(text)\n\n".utf8)
+    if !FileManager.default.fileExists(atPath: path) {
+        guard FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            log("cannot create \(path)"); return false
+        }
+    }
+    do {
+        let h = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        defer { try? h.close() }
+        try h.seekToEnd()
+        try h.write(contentsOf: entry)
+    } catch {
+        log("cannot write \(path): \(error.localizedDescription)")
+        return false
     }
     log("saved to \(path)")
+    return true
 }
 
 /// Copies to the clipboard, and pastes (Cmd+V, optional Return) only when this
@@ -220,7 +263,24 @@ let btmicAudio   = CBUUID(string: "5E3B0001-8A7C-4F1E-9B2D-7C4A1F0E6D10")
 let btmicCtrl    = CBUUID(string: "5E3B0002-8A7C-4F1E-9B2D-7C4A1F0E6D10")
 let hidService   = CBUUID(string: "1812")
 
-enum Ctrl: UInt8 { case busy = 1, done = 2, err = 3, ping = 5 }
+enum Ctrl: UInt8 { case busy = 1, done = 2, err = 3, ping = 5, retry = 6 }
+
+// BTMIC_KEEP=1: keep a copy of each recording in ~/btmic-samples (private, for comparing models).
+func keepSample(_ wav: URL) {
+    let dir = NSHomeDirectory() + "/btmic-samples"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true,
+                                             attributes: [.posixPermissions: 0o700])
+    let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+    try? FileManager.default.copyItem(at: wav, to: URL(fileURLWithPath: "\(dir)/\(f.string(from: Date())).wav"))
+}
+
+// One receiver at a time: a second copy would fight over the stick. The lock goes
+// away with the process, so a crash never leaves it stuck.
+func takeSingleInstanceLock() -> Bool {
+    let fd = open(NSHomeDirectory() + "/.btmic.lock", O_CREAT | O_RDWR, 0o600)
+    if fd < 0 { return true }
+    return flock(fd, LOCK_EX | LOCK_NB) == 0           // fd stays open for the life of the process
+}
 
 func log(_ s: String) {
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
@@ -229,6 +289,10 @@ func log(_ s: String) {
     fflush(stdout)
     // Launched as an app there is no terminal, so also keep a log file.
     let path = NSHomeDirectory() + "/.btmic.log"
+    if let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int, size > 1_000_000 {
+        try? FileManager.default.removeItem(atPath: path + ".1")
+        try? FileManager.default.moveItem(atPath: path, toPath: path + ".1")
+    }
     if let h = FileHandle(forWritingAtPath: path) ?? {
         FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
         return FileHandle(forWritingAtPath: path)
@@ -251,6 +315,9 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var pcm: [Int16] = []
     private var lostFrames = 0
     private var offline = false
+    private var lastFinished: UInt16? = nil      // a finished session: its late frames must not start a new one
+    private var gotEnd = false
+    private var queued: [UInt16] = []            // recordings waiting for or in transcription
     private var heartbeat: Timer?
     private var idleTimeout: DispatchWorkItem?
 
@@ -351,7 +418,7 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             // The stick only treats this Mac as present while it hears this every few seconds.
             send(.ping)
             heartbeat?.invalidate()
-            heartbeat = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.send(.ping) }
+            heartbeat = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.beat() }
         }
     }
 
@@ -362,6 +429,7 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         case .start:
             begin(session: f.session, firstSeq: 1, offline: f.flags & flagOffline != 0)
         case .audio:
+            if !active && f.session == lastFinished { return }
             if !active || f.session != session { begin(session: f.session, firstSeq: f.seq, offline: f.flags & flagOffline != 0) }
             if f.seq != expectSeq {
                 let missing = Int(f.seq &- expectSeq)
@@ -371,15 +439,15 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 }
             }
             expectSeq = f.seq &+ 1
-            pcm += f.pcm
+            if pcm.count < maxSamples { pcm += f.pcm }      // 70 s is more than the stick ever sends
             armIdleTimeout()
         case .end:
-            if active && f.session == session { finish() }
+            if active && f.session == session { gotEnd = true; finish() }
         }
     }
 
     private func begin(session s: UInt16, firstSeq: UInt16, offline off: Bool) {
-        active = true; session = s; expectSeq = firstSeq; pcm = []; lostFrames = 0; offline = off
+        active = true; session = s; expectSeq = firstSeq; pcm = []; lostFrames = 0; offline = off; gotEnd = false
         log(off ? "receiving a stored recording (session \(s))" : "recording (session \(s))")
         armIdleTimeout()
     }
@@ -393,7 +461,9 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             self.finish()
         }
         idleTimeout = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+        // A stored recording is sent with retries of up to 4 s per frame on a weak link,
+        // so it gets a longer quiet period than live audio.
+        DispatchQueue.main.asyncAfter(deadline: .now() + (offline ? 10 : 1.5), execute: w)
     }
 
     private func finish() {
@@ -403,15 +473,26 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let lost = lostFrames
         let stored = offline
         pcm = []
+        lastFinished = session
+        // A stored recording that never reached its end frame is cut short: do not
+        // transcribe or acknowledge it, the stick still has the whole thing and
+        // will send it again.
+        if stored && !gotEnd {
+            log("stored recording incomplete (no end frame), discarded; the stick will resend")
+            send(.retry, session: session)
+            return
+        }
         log(String(format: "recorded %.1f s, lost frames: %d", Double(samples.count) / 16000, lost))
         let sess = session
         send(.busy, session: sess)
+        queued.append(sess)
         work.async { self.process(samples, stored: stored, session: sess) }
     }
 
     // ---- transcribe + deliver ------------------------------------------------
     private func process(_ samples: [Int16], stored: Bool, session sess: UInt16) {
-        func reply(_ c: Ctrl) { DispatchQueue.main.async { self.send(c, session: sess) } }
+        func reply(_ c: Ctrl) { DispatchQueue.main.async { self.queued.removeAll { $0 == sess }; self.send(c, session: sess) } }
+        defer { DispatchQueue.main.async { self.queued.removeAll { $0 == sess } } }
         // A stored recording with nothing in it is not a failure: tell the stick it
         // may drop it, otherwise it would flash ERR and keep re-sending it.
         let nothing: Ctrl = stored ? .done : .err
@@ -421,20 +502,25 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let rms = (sum / Double(samples.count)).squareRoot()
         guard rms >= 40 else { log("silence (rms \(Int(rms))), ignored"); reply(nothing); return }
 
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btmic-\(getpid())-\(session)")
-        defer { try? FileManager.default.trashItem(at: dir, resultingItemURL: nil) }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btmic-\(getpid())-\(sess)")
+        // Our own scratch files (audio and text): delete for good, never into the Trash.
+        defer { try? FileManager.default.removeItem(at: dir) }
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let wav = dir.appendingPathComponent("rec.wav")
             try writeWav16kMono(samples, to: wav)
+            if ProcessInfo.processInfo.environment["BTMIC_KEEP"] == "1" { keepSample(wav) }
             let started = Date()
             let text = try transcribe(wav: wav, language: language, model: model)
-            log(String(format: "text (%.1f s): %@", Date().timeIntervalSince(started), text))
+            // The transcript is clinical content: the log gets its length, the text only on request.
+            let shown = ProcessInfo.processInfo.environment["BTMIC_LOG_TEXT"] == "1" ? ": \(text)" : ""
+            log(String(format: "text (%.1f s, %d chars)", Date().timeIntervalSince(started), text.count) + shown)
             guard !text.isEmpty else { reply(nothing); return }
             DispatchQueue.main.async {
                 if stored {
                     // Recorded earlier: the cursor is somewhere else now, so file it instead of pasting.
-                    saveToInbox(text)
+                    // If it cannot be filed the stick must keep it: no DONE.
+                    guard saveToInbox(text) else { return }
                 } else {
                     deliver(text, pressReturn: self.pressReturn)
                 }
@@ -445,6 +531,13 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             // A stored recording stays on the stick for another try; only live ones are answered.
             if !stored { reply(.err) }
         }
+    }
+
+    /// Ping every 2 s; while recordings are being transcribed also repeat BUSY so a
+    /// stick that is waiting for the answer does not give up and send it again.
+    private func beat() {
+        send(.ping)
+        for s in queued { send(.busy, session: s) }
     }
 
     /// Status goes with the recording's session number so a stick that is waiting
@@ -486,7 +579,7 @@ func fail(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n")
 
 let args = Array(CommandLine.arguments.dropFirst())
 let language = ProcessInfo.processInfo.environment["BTMIC_LANG"] ?? "zh"
-let model = ProcessInfo.processInfo.environment["BTMIC_MODEL"] ?? "mlx-community/whisper-medium"
+let model = ProcessInfo.processInfo.environment["BTMIC_MODEL"] ?? "eoleedi/Breeze-ASR-25-mlx"
 
 switch args.first {
 case "selftest":
@@ -537,6 +630,7 @@ case "probe":
     let probe = Probe()
     withExtendedLifetime(probe) { RunLoop.main.run() }
 case "listen":
+    if !takeSingleInstanceLock() { log("btmic is already running, exiting"); exit(0) }
     log("btmic listen started")
     if !AXIsProcessTrusted() {
         log("note: no Accessibility permission, text will be copied but not pasted")

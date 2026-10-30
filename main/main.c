@@ -41,6 +41,8 @@
 #include "class/hid/hid.h"
 #include "class/hid/hid_device.h"
 #include "esp_system.h"
+#include "hal/wdt_hal.h"
+#include "soc/rtc.h"
 #include "nvs_flash.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
@@ -183,6 +185,8 @@ RTC_NOINIT_ATTR volatile uint32_t vox_stall_magic;
 RTC_NOINIT_ATTR volatile char     vox_holder[5];     // who held the LCD lock at the stall
 RTC_NOINIT_ATTR volatile uint8_t  vox_stuck_mask;    // bit0 display, bit1 button, bit2 recording
 static volatile uint32_t g_hb_disp = 0, g_hb_btn = 0;
+static volatile int g_hb_stuck_max[3];            // longest quiet spell (s) seen per watched task: display, button, recording
+static TaskHandle_t g_disp_task = NULL;          // the display task, for the markers in lcd_fill_rect
 
 static const app_t *volatile g_cur = NULL;    // NULL = the menu
 static volatile TickType_t g_last_activity = 0;   // buttons / UI changes; drives screen sleep
@@ -227,7 +231,12 @@ static bool effective_mic_muted(void)
 static esp_lcd_panel_handle_t g_lcd = NULL;
 // Static line buffer is enough for a single full-width row — colors fit in a
 // uint16_t and we paint by repeating one row 240 times.
-static uint16_t g_lcd_line[LCD_W];
+static uint16_t g_lcd_line[2][LCD_W];            // two buffers: the last row of a rect may still be on the wire
+static int g_lcd_line_sel = 0;
+static StaticSemaphore_t g_lcd_spi_mu_buf;
+static SemaphoreHandle_t g_lcd_spi_mu = NULL;     // leaf lock around one rectangle: SPI and buffers never shared
+static volatile uint32_t g_lcd_contended = 0;     // times a drawer had to wait for another one
+static volatile uint32_t g_lcd_wait_max_ms = 0;
 
 static inline uint16_t lcd_swap_rgb565(uint16_t rgb565)
 {
@@ -335,12 +344,25 @@ static void lcd_fill_rect(int x0, int y0, int x1, int y1, uint16_t rgb565)
     if (y1 > LCD_H) y1 = LCD_H;
     if (x0 >= x1 || y0 >= y1) return;
 
+    if (!g_lcd_spi_mu) g_lcd_spi_mu = xSemaphoreCreateMutexStatic(&g_lcd_spi_mu_buf);   // first draw is single-threaded (boot)
+    if (xSemaphoreTake(g_lcd_spi_mu, 0) != pdTRUE) {
+        TickType_t t0 = xTaskGetTickCount();
+        g_lcd_contended++;
+        xSemaphoreTake(g_lcd_spi_mu, portMAX_DELAY);
+        uint32_t ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0);
+        if (ms > g_lcd_wait_max_ms) g_lcd_wait_max_ms = ms;
+    }
     uint16_t px = lcd_swap_rgb565(rgb565);
     int width = x1 - x0;
-    for (int x = 0; x < width; x++) g_lcd_line[x] = px;
+    uint16_t *line = g_lcd_line[g_lcd_line_sel ^= 1];
+    for (int x = 0; x < width; x++) line[x] = px;
+    bool mine = (g_disp_task != NULL && xTaskGetCurrentTaskHandle() == g_disp_task);
+    if (mine) vox_where_disp = 5;                // inside an LCD transfer: a stall here means the SPI draw hung
     for (int y = y0; y < y1; y++) {
-        esp_lcd_panel_draw_bitmap(g_lcd, x0, y, x1, y + 1, g_lcd_line);
+        esp_lcd_panel_draw_bitmap(g_lcd, x0, y, x1, y + 1, line);
     }
+    if (mine) vox_where_disp = 4;
+    xSemaphoreGive(g_lcd_spi_mu);
 }
 
 static volatile bool g_bar_dirty = true;         // status bar needs repainting
@@ -443,7 +465,7 @@ static SemaphoreHandle_t g_pres_lcd_mu = NULL;
 static void lcd_draw_digit(int x, int y, int d, uint16_t col);
 
 // Tiny 5x7 text for menu labels. Column-major, bit0 = top row.
-static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY0123456789%-FVWQ";
+static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY0123456789%-FVWQXJZ:./!";
 static const uint8_t k_font[][5] = {
     {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
     {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x3E,0x41,0x49,0x49,0x7A},
@@ -458,6 +480,9 @@ static const uint8_t k_font[][5] = {
     {0x06,0x49,0x49,0x29,0x1E}, {0x23,0x13,0x08,0x64,0x62}, {0x08,0x08,0x08,0x08,0x08},
     {0x7F,0x09,0x09,0x09,0x01}, {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F},
     {0x3E,0x41,0x51,0x21,0x5E},
+    {0x63,0x14,0x08,0x14,0x63}, {0x20,0x40,0x41,0x3F,0x01}, {0x61,0x51,0x49,0x45,0x43},   // X J Z
+    {0x00,0x36,0x36,0x00,0x00}, {0x00,0x60,0x60,0x00,0x00}, {0x20,0x10,0x08,0x04,0x02},   // : . /
+    {0x00,0x00,0x5F,0x00,0x00},                                                          // !
 };
 
 static int lcd_text_width(const char *s, int scale)
@@ -497,6 +522,8 @@ static void battery_sample(void);              // defined next to the PMIC code
 static int g_fault_reason = 0;                 // esp_reset_reason() if the last reset was abnormal
 static uint32_t g_fault_crumb = 0;
 static char g_fault_who[12] = "";
+static volatile int g_batt_mv = 0;
+static volatile int g_batt_dbg = 0;            // 0 = last battery read fine; else error code or 10000+mV
 
 // Paints the bar. The caller must hold g_pres_lcd_mu (or be the only drawer).
 static void statusbar_paint(void)
@@ -526,12 +553,8 @@ static void statusbar_paint(void)
     } else {
         lcd_draw_text(36, 3, "--", 2, 0x7BEF);
     }
-    if (g_fault_reason) {                       // died last time: reason, then display/button/rec markers
-        char d[20];
-        snprintf(d, sizeof(d), "R%d C%05u", g_fault_reason % 100, (unsigned)(g_fault_crumb % 100000));
-        lcd_fill_rect(34, 0, 114, BAR_H, COL_BLACK);
-        lcd_draw_text(36, 2, d, 1, COL_RED);
-        lcd_draw_text(36, 11, g_fault_who, 1, COL_RED);
+    if (g_fault_reason) {                       // the stick reset itself: open DIAG
+        lcd_draw_text(94, 6, "!", 2, COL_RED);
     }
     // Bluetooth link dot
     int r = 5, cx = LCD_W - 12, cy = BAR_H / 2;
@@ -721,11 +744,6 @@ static void lcd_draw_btrec(int ui, bool note)
     while (scale > 1 && lcd_text_width(word, scale) > LCD_W - 8) scale--;
     lcd_draw_text((LCD_W - lcd_text_width(word, scale)) / 2,
                   (LCD_H - 7 * scale) / 2, word, scale, wcol);
-    if (note) {                                  // upload diagnostics, small, bottom
-        char d[16];
-        btmic_debug(d, sizeof(d));
-        lcd_draw_text(4, LCD_H - 12, d, 1, 0x7BEF);          // mid grey; COL_DARK_GRAY is near black
-    }
     if (note && pending > 0 && ui != BTMIC_UI_REC_OFF && ui != BTMIC_UI_REC) {
         char s[24];
         snprintf(s, sizeof(s), "%d PENDING", pending % 100);
@@ -822,6 +840,7 @@ static const app_t app_bt_dict, app_slide;      // defined with the other apps b
 static void vad_lcd_task(void *arg)
 {
     (void)arg;
+    g_disp_task = xTaskGetCurrentTaskHandle();
     g_vad_display_enabled = true;
 
     const app_t *last = (const app_t *)-1;      // forces the first paint
@@ -998,11 +1017,37 @@ static esp_err_t pmic_read_n(uint8_t reg, uint8_t *out, size_t n)
     return ret;
 }
 
+// Linear map of cell voltage to percent (same curve as before: 100 % at 4100 mV).
+#define BATT_EMPTY_MV 3300
+#define BATT_FULL_MV  4100
+
 static void battery_sample(void)
 {
     uint8_t v[2] = {0}, src = 0xFF;
-    if (pmic_read_n(0x22, v, 2) != ESP_OK) { g_batt_pct = -1; return; }
+    // The codec shares this I2C bus, so a read can fail while it is busy. Try a few
+    // times; if it still fails keep showing the last good value, and after repeated
+    // failures reset the bus (a stuck transfer would otherwise fail every read).
+    static int s_fails = 0;
+    // While the radio is busy the chip sometimes answers with nonsense (about 12 mV
+    // was seen), so a reading outside the plausible range is retried like an error.
+    esp_err_t e = ESP_FAIL;
+    for (int i = 0; i < 4; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(30));
+        e = pmic_read_n(0x22, v, 2);
+        int m = v[0] | ((v[1] & 0x0F) << 8);
+        if (e == ESP_OK && m >= 2500 && m <= 4600) break;
+    }
+    if (e != ESP_OK) {
+        g_batt_dbg = (int)e < 0 ? -(int)e : (int)e;
+        ESP_LOGW(TAG, "battery read failed (%s), %d in a row", esp_err_to_name(e), s_fails + 1);
+        // Resetting the bus cuts into other devices on it (IMU, codec): only after repeated
+        // failures, and never when the chip is simply not there.
+        if (++s_fails >= 5 && e != ESP_ERR_NOT_FOUND) { i2c_master_bus_reset(g_i2c_bus); s_fails = 0; }
+        return;                                  // keep the previous reading on screen
+    }
+    s_fails = 0;
     int mv = v[0] | ((v[1] & 0x0F) << 8);
+    g_batt_mv = mv;
     if (pmic_read_n(0x04, &src, 1) != ESP_OK) src = 0xFF;
     // Measured on a StickS3: VIN reads ~1100 mV with a cable in and 0 on battery
     // (not the real 5 V, so the ADC is scaled), 5VINOUT ~960 vs ~20, and PWR_SRC
@@ -1012,11 +1057,13 @@ static void battery_sample(void)
     if (pmic_read_n(0x24, w, 4) == ESP_OK) {
         vin = w[0] | ((w[1] & 0x0F) << 8);
         vio = w[2] | ((w[3] & 0x0F) << 8);
+        g_batt_ext = (vin > 500 || vio > 500);      // a failed read keeps the last answer (no flicker of the bolt)
     }
-    g_batt_ext = (vin > 500 || vio > 500);
-    if (mv < 2500 || mv > 4600) { g_batt_pct = -1; }       // implausible: show "--"
-    else {
-        int pct = (mv - 3300) * 100 / (4150 - 3350);
+    if (mv < 2500 || mv > 4600) {                          // implausible: keep the last good reading
+        g_batt_dbg = 10000 + (mv % 10000);
+    } else {
+        g_batt_dbg = 0;
+        int pct = (mv - BATT_EMPTY_MV) * 100 / (BATT_FULL_MV - BATT_EMPTY_MV);
         g_batt_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
     }
     ESP_LOGI(TAG, "battery %d mV -> %d%%, pwr_src=%u vin=%d vio=%d ext=%d",
@@ -1346,8 +1393,8 @@ static BMI2_INTF_RETURN_TYPE imu_i2c_write(uint8_t reg_addr,
 static void imu_delay_us(uint32_t period_us, void *intf_ptr)
 {
     (void)intf_ptr;
-    if (period_us >= 1000) {
-        vTaskDelay(pdMS_TO_TICKS(period_us / 1000));
+    if (period_us >= 10000) {                      // the tick is 10 ms: anything shorter rounds to a zero-tick delay
+        vTaskDelay(pdMS_TO_TICKS(period_us / 1000) + 1);
     } else {
         esp_rom_delay_us(period_us);
     }
@@ -1745,8 +1792,12 @@ static void hid_send_tap(uint8_t modifier, uint8_t keycode)
     uint8_t down[6] = { keycode };
     uint8_t up  [6] = { 0 };
     tud_hid_keyboard_report(HID_REPORT_ID_KBD, modifier, down);
-    vTaskDelay(pdMS_TO_TICKS(15));
-    tud_hid_keyboard_report(HID_REPORT_ID_KBD, 0, up);
+    vTaskDelay(2);                                  // 20 ms: the host polls every 10 ms and must see the press
+    // The release must not be lost, or the key sticks down and the host repeats it.
+    for (int i = 0; i < 10; i++) {
+        if (tud_hid_ready() && tud_hid_keyboard_report(HID_REPORT_ID_KBD, 0, up)) break;
+        vTaskDelay(1);
+    }
 }
 
 // =========================================================================
@@ -1806,7 +1857,9 @@ static uint32_t usb_mic_tick(bool first)
     uint32_t bucket = capped / 240U;
     if (active != last_active || codec_ready != last_codec_ready ||
         muted != last_muted || bucket != last_bucket) {
+        xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
         lcd_draw_mic_status(capped, active, codec_ready, muted);
+        xSemaphoreGive(g_pres_lcd_mu);
         last_active = active;
         last_codec_ready = codec_ready;
         last_muted = muted;
@@ -1880,6 +1933,81 @@ static void note_front_down(void)        { btmic_start(true); }    // stored on 
 static void voice_front_up(uint32_t held, bool is_long) { (void)held; (void)is_long; btmic_stop(); }
 static void voice_side_down(void)        { if (!btmic_recording()) enter_app(NULL); }
 
+// ---- DIAG: what the stick knows about itself ------------------------------------
+static void icon_diag(int x, int y, uint16_t fg, uint16_t bg)      // warning triangle with "!"
+{
+    (void)bg;
+    lcd_draw_thick_line(x + 14, y + 3, x + 2, y + 25, 2, fg);
+    lcd_draw_thick_line(x + 14, y + 3, x + 26, y + 25, 2, fg);
+    lcd_draw_thick_line(x + 2, y + 25, x + 26, y + 25, 2, fg);
+    lcd_fill_rect(x + 13, y + 10, x + 16, y + 18, fg);
+    lcd_fill_rect(x + 13, y + 20, x + 16, y + 23, fg);
+}
+
+#define DIAG_LINES 12
+static char g_diag_shown[DIAG_LINES][48];
+
+// Redraws one 9 px line only if its text changed.
+static void diag_line(int i, const char *s, uint16_t col)
+{
+    if (strcmp(g_diag_shown[i], s) == 0) return;
+    snprintf(g_diag_shown[i], sizeof(g_diag_shown[i]), "%s", s);
+    int y = BAR_H + 6 + i * 11;
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_fill_rect(0, y, LCD_W, y + 9, COL_BLACK);
+    lcd_draw_text(4, y, s, 1, col);
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
+static uint32_t diag_tick(bool first)
+{
+    static const char *ui_name[] = { "NO LINK", "READY", "REC", "BUSY", "DONE", "ERR", "REC OFF", "SYNC", "FULL" };
+    if (first) memset(g_diag_shown, 0, sizeof(g_diag_shown));
+    char s[48], d[24];
+    int ui = (int)btmic_ui_state();
+    snprintf(s, sizeof(s), "LINK %s", ui >= 0 && ui < 9 ? ui_name[ui] : "?");
+    diag_line(0, s, COL_CYAN);
+    snprintf(s, sizeof(s), "PENDING %d", btmic_pending() % 100);
+    diag_line(1, s, COL_YELLOW);
+    btmic_debug(d, sizeof(d));
+    snprintf(s, sizeof(s), "UPLOAD %s", d);
+    diag_line(2, s, COL_LIGHT_GRAY);
+    if (g_batt_pct >= 0) snprintf(s, sizeof(s), "BATT %d%% %dMV %s", g_batt_pct, g_batt_mv, g_batt_ext ? "USB" : "BAT");
+    else snprintf(s, sizeof(s), "BATT UNKNOWN");
+    diag_line(3, s, COL_LIGHT_GRAY);
+    if (g_batt_dbg >= 10000) snprintf(s, sizeof(s), "READ ODD V%d KEEP OLD", g_batt_dbg - 10000);
+    else if (g_batt_dbg) snprintf(s, sizeof(s), "READ FAIL E%d", g_batt_dbg % 1000);
+    else snprintf(s, sizeof(s), "READ OK");
+    diag_line(4, s, g_batt_dbg >= 10000 ? COL_YELLOW : (g_batt_dbg ? COL_RED : COL_GREEN));
+    snprintf(s, sizeof(s), "HEAP %uK MIN %uK", (unsigned)(esp_get_free_heap_size() / 1024),
+             (unsigned)(esp_get_minimum_free_heap_size() / 1024));
+    diag_line(5, s, COL_LIGHT_GRAY);
+    snprintf(s, sizeof(s), "UP %u S", (unsigned)(xTaskGetTickCount() / configTICK_RATE_HZ));
+    diag_line(6, s, COL_LIGHT_GRAY);
+    snprintf(s, sizeof(s), "LCD WAIT %u MAX %u MS", (unsigned)g_lcd_contended, (unsigned)g_lcd_wait_max_ms);
+    diag_line(7, s, COL_LIGHT_GRAY);
+    snprintf(s, sizeof(s), "QUIET MAX D%d B%d R%d S", g_hb_stuck_max[0], g_hb_stuck_max[1], g_hb_stuck_max[2]);
+    diag_line(10, s, g_hb_stuck_max[0] >= 4 || g_hb_stuck_max[1] >= 4 || g_hb_stuck_max[2] >= 5 ? COL_YELLOW : COL_LIGHT_GRAY);
+    if (g_fault_reason) {
+        snprintf(s, sizeof(s), "LAST RESET R%d", g_fault_reason % 100);
+        diag_line(8, s, COL_RED);
+        snprintf(s, sizeof(s), "C%05u %s", (unsigned)(g_fault_crumb % 100000), g_fault_who);
+        diag_line(9, s, COL_RED);
+        diag_line(11, "FRONT CLEARS  SIDE BACK", COL_LIGHT_GRAY);
+    } else {
+        diag_line(8, "LAST RESET NONE", COL_GREEN);
+        diag_line(11, "SIDE BACK", COL_LIGHT_GRAY);
+    }
+    return 1000;
+}
+
+static void diag_front_down(void)                 // front button: mark the reset as seen
+{
+    g_fault_reason = 0;
+    g_batt_dbg = 0;
+    g_bar_dirty = true;
+}
+
 static const app_t app_usb_mic = {
     .name = "USB MIC", .color = COL_CYAN, .icon = icon_mic,
     .flags = APP_NO_SLEEP | APP_USB_MIC | APP_HOLD_EXITS,
@@ -1908,7 +2036,13 @@ static const app_t app_slide = {
     .tick = slide_tick, .front_up = slide_front_up, .side_down = slide_side_down,
 };
 
-static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide };
+static const app_t app_diag = {
+    .name = "DIAG", .color = COL_RED, .icon = icon_diag,
+    .flags = APP_BLE,                                      // BLE up so LINK and UPLOAD mean something
+    .tick = diag_tick, .front_down = diag_front_down,
+};
+
+static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide, &app_diag };
 static const app_t *launcher_app(int i)  { return k_apps[i]; }
 static int          launcher_count(void) { return (int)(sizeof(k_apps) / sizeof(k_apps[0])); }
 
@@ -1919,25 +2053,41 @@ static void monitor_task(void *arg)
     (void)arg;
     uint32_t last[3] = {0, 0, 0};
     int stuck[3] = {0, 0, 0};
+
+    // Last line of defence: the RTC watchdog runs from its own clock, so it still
+    // resets the chip when the whole system is stuck (a stalled flash operation, a
+    // locked-up bus) and the software watchdogs cannot run. This task feeds it.
+    wdt_hal_context_t rwdt = RWDT_HAL_CONTEXT_DEFAULT();
+    wdt_hal_init(&rwdt, WDT_RWDT, 0, false);
+    wdt_hal_write_protect_disable(&rwdt);
+    wdt_hal_config_stage(&rwdt, WDT_STAGE0, (uint32_t)(8000ULL * rtc_clk_slow_freq_get_hz() / 1000ULL),
+                         WDT_STAGE_ACTION_RESET_SYSTEM);   // RTC memory (our markers) survives this
+    wdt_hal_enable(&rwdt);
+    wdt_hal_write_protect_enable(&rwdt);
+
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        wdt_hal_write_protect_disable(&rwdt);
+        wdt_hal_feed(&rwdt);
+        wdt_hal_write_protect_enable(&rwdt);
         uint32_t now[3] = { g_hb_disp, g_hb_btn, vox_hb_rec };
         bool dead = false;
         for (int i = 0; i < 3; i++) {
             stuck[i] = (now[i] == last[i]) ? stuck[i] + 1 : 0;
+            if (i == 0 && !g_disp_task) stuck[0] = 0;        // no display task yet (or in a build without one)
+            if (stuck[i] > g_hb_stuck_max[i]) g_hb_stuck_max[i] = stuck[i];
             last[i] = now[i];
             if (stuck[i] >= 6) dead = true;
         }
         if (dead) {
             TaskHandle_t h = g_pres_lcd_mu ? xSemaphoreGetMutexHolder(g_pres_lcd_mu) : NULL;
-            const char *nm = h ? pcTaskGetName(h) : "-";
-            for (int i = 0; i < 4; i++) vox_holder[i] = nm[i] ? nm[i] : ' ';
-            vox_holder[4] = 0;
+            const char *nm = h ? pcTaskGetName(h) : "";
+            char c = !h ? 'N' : (h == g_disp_task ? 'D' : (strcmp(nm, "btn") == 0 ? 'B' :
+                     (strcmp(nm, "btmic") == 0 ? 'R' : 'O')));      // none, display, button, recording, other
+            vox_holder[0] = c; vox_holder[1] = 0;
             vox_stuck_mask = (stuck[0] >= 6) | ((stuck[1] >= 6) << 1) | ((stuck[2] >= 6) << 2);
             vox_stall_magic = 0xBEEF;
-            ESP_LOGE(TAG, "stalled: disp=%d btn=%d rec=%d where d=%u b=%u r=%u",
-                     stuck[0], stuck[1], stuck[2], (unsigned)vox_where_disp,
-                     (unsigned)vox_where_btn, (unsigned)vox_crumb);
+            // Restart first: a log line can block on the very lock the stuck task holds.
             esp_restart();
         }
     }
@@ -2102,15 +2252,20 @@ void app_main(void)
     ESP_LOGI(TAG, "uac+hid composite advertised as 'StickS3-Mic'");
 #endif
 
+    g_pres_lcd_mu = xSemaphoreCreateMutexStatic(&g_pres_lcd_mu_buf);   // before any task can draw
     buttons_init();
     {   // Abnormal reset? Remember why, and where the stick said it was working.
         esp_reset_reason_t rr = esp_reset_reason();
         if (rr == ESP_RST_SW && vox_stall_magic == 0xBEEF) {            // the monitor restarted us
-            g_fault_reason = 8;
-            snprintf(g_fault_who, sizeof(g_fault_who), "M%u %.4s", (unsigned)vox_stuck_mask, (const char *)vox_holder);
+            g_fault_reason = 50;                                          // our own code; 8 is ESP_RST_DEEPSLEEP
+            snprintf(g_fault_who, sizeof(g_fault_who), "M%u H%c", (unsigned)vox_stuck_mask, vox_holder[0] ? vox_holder[0] : 'N');
             g_fault_crumb = (uint32_t)vox_where_disp * 10000 + (uint32_t)vox_where_btn * 1000 + (vox_crumb % 1000);
+        } else if (rr == ESP_RST_WDT) {                                  // the hardware watchdog: whole chip was stuck
+            g_fault_reason = (int)rr;
+            g_fault_crumb = (uint32_t)vox_where_disp * 10000 + (uint32_t)vox_where_btn * 1000 + (vox_crumb % 1000);
+            snprintf(g_fault_who, sizeof(g_fault_who), "HW HANG");
         } else if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
-                   rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT) {
+                   rr == ESP_RST_BROWNOUT) {
             g_fault_reason = (int)rr;
             g_fault_crumb = vox_crumb;
         }
@@ -2135,7 +2290,6 @@ void app_main(void)
 
 #if !VOX_DEBUG_NO_UAC
     lcd_draw_mic_status(0, false, g_codec_ready, effective_mic_muted());
-    g_pres_lcd_mu = xSemaphoreCreateMutexStatic(&g_pres_lcd_mu_buf);
     xTaskCreate(vad_lcd_task, "vad_lcd", 3072, NULL, 6, NULL);   // above btmic/btn so uploads cannot starve the screen
 #endif
 

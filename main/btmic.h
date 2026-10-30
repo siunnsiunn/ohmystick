@@ -1,5 +1,5 @@
 #pragma once
-// BT REC: streams the StickS3 microphone to a Mac helper over a custom BLE GATT
+// WHISPER / NOTE: streams the StickS3 microphone to a Mac helper over a custom BLE GATT
 // service (docs/BT-MIC.md). Audio is IMA ADPCM, 20 ms per notification, and is
 // only captured while the front button is held.
 #include <stdbool.h>
@@ -37,7 +37,7 @@ void       btmic_set_mode(bool sync_ok, bool maintain_ok);
 int        btmic_pending(void);     // recordings stored on the stick
 void       btmic_debug(char *buf, size_t n);   // short upload diagnostics for the screen
 extern volatile uint32_t vox_crumb;
-extern volatile uint32_t vox_hb_rec;            // last activity marker; survives a reset
+extern volatile uint32_t vox_hb_rec;            // last activity marker; checked by the monitor task
 
 bool       btmic_start(bool offline); // live (needs the Mac listening) or stored on the stick; false if not possible
 void       btmic_stop(void);
