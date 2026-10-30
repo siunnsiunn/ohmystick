@@ -30,3 +30,6 @@ managed_components/
 
 # Upstream is a fetched reference, not part of the project
 upstream/
+
+# Mac helper build output
+tools/btmic/out/

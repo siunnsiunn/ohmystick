@@ -533,6 +533,16 @@ static void lcd_draw_ble_dictation(void)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
+// Presenter/mic screens only repaint the middle band, so wipe the whole panel
+// when a mode is entered (otherwise the menu colours stay at the top/bottom).
+static void lcd_clear_locked(void)
+{
+    if (!g_lcd) return;
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_clear(COL_BLACK);
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
 static void lcd_draw_presenter(void)
 {
     if (!g_lcd) return;
@@ -629,10 +639,12 @@ static void vad_lcd_task(void *arg)
             }
             bool ble_up = ble_presenter_connected();
             int ble_st = ble_presenter_state();
+            bool mode_changed = (last_mode != (int)mode);
             if (last_mode != (int)mode || ble_up != last_ble_up || ble_st != last_ble_st) {
                 last_mode = (int)mode;
                 last_ble_up = ble_up;
                 last_ble_st = ble_st;
+                if (mode_changed) lcd_clear_locked();
                 if (mode == MODE_PRESENTER) lcd_draw_presenter();
                 else                        lcd_draw_ble_dictation();
             }
@@ -644,6 +656,7 @@ static void vad_lcd_task(void *arg)
         if (last_mode != (int)mode) {
             last_mode = (int)mode;
             last_bucket = UINT32_MAX;     // force a mic-screen redraw
+            lcd_clear_locked();           // drop the menu colours
             if (!g_vad_display_enabled) {
                 lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
             }
