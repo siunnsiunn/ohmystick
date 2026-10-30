@@ -356,9 +356,11 @@ static void lcd_fill_rect(int x0, int y0, int x1, int y1, uint16_t rgb565)
     }
 }
 
+static volatile bool g_bar_dirty = true;         // status bar needs repainting
 static void lcd_clear(uint16_t rgb565)
 {
     lcd_fill_rect(0, 0, LCD_W, LCD_H, rgb565);
+    g_bar_dirty = true;
 }
 
 // Low-power boot/status marker: black screen plus a tiny colour badge.
@@ -454,7 +456,7 @@ static SemaphoreHandle_t g_pres_lcd_mu = NULL;
 static void lcd_draw_digit(int x, int y, int d, uint16_t col);
 
 // Tiny 5x7 text for menu labels. Column-major, bit0 = top row.
-static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY";
+static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY0123456789%-";
 static const uint8_t k_font[][5] = {
     {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
     {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x3E,0x41,0x49,0x49,0x7A},
@@ -463,6 +465,10 @@ static const uint8_t k_font[][5] = {
     {0x3E,0x41,0x41,0x41,0x3E}, {0x7F,0x09,0x09,0x09,0x06}, {0x7F,0x09,0x19,0x29,0x46},
     {0x26,0x49,0x49,0x49,0x32}, {0x01,0x01,0x7F,0x01,0x01}, {0x3F,0x40,0x40,0x40,0x3F},
     {0x07,0x08,0x70,0x08,0x07},
+    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E}, {0x23,0x13,0x08,0x64,0x62}, {0x08,0x08,0x08,0x08,0x08},
 };
 
 static int lcd_text_width(const char *s, int scale)
@@ -490,15 +496,148 @@ static void lcd_draw_text(int x, int y, const char *s, int scale, uint16_t col)
     }
 }
 
+// ---- Status bar (top 20 px): battery, charging, Bluetooth link ---------------
+#define BAR_H          20
+#define BATT_LOW_PCT   15
+static int           g_batt_pct    = -1;       // -1 = unknown
+static bool          g_batt_ext    = false;    // running from USB power
+static bool          g_bar_ble     = false;
+static int           g_bar_shown_pct = -2;
+static bool          g_bar_shown_ext = false, g_bar_shown_ble = false;
+
+static void battery_sample(void);              // defined next to the PMIC code
+
+// Paints the bar. The caller must hold g_pres_lcd_mu (or be the only drawer).
+static void statusbar_paint(void)
+{
+    g_bar_dirty = false;
+    g_bar_shown_pct = g_batt_pct; g_bar_shown_ext = g_batt_ext; g_bar_shown_ble = g_bar_ble;
+    lcd_fill_rect(0, 0, LCD_W, BAR_H, COL_BLACK);
+    uint16_t col = (g_batt_pct >= 0 && g_batt_pct <= BATT_LOW_PCT) ? COL_RED
+                 : (g_batt_ext ? COL_GREEN : COL_LIGHT_GRAY);
+    // battery icon: outline, nub, fill proportional to charge
+    lcd_fill_rect(4, 4, 28, 15, col);
+    lcd_fill_rect(6, 6, 26, 13, COL_BLACK);
+    lcd_fill_rect(28, 7, 30, 12, col);
+    if (g_batt_pct >= 0) {
+        int w = (20 * g_batt_pct) / 100;
+        if (w < 1) w = 1;
+        lcd_fill_rect(6, 6, 6 + w, 13, col);
+        char s[6];
+        snprintf(s, sizeof(s), "%d%%", g_batt_pct);
+        lcd_draw_text(36, 3, s, 2, col);
+        if (g_batt_ext) {                       // lightning bolt
+            int bx = 36 + lcd_text_width(s, 2) + 6;
+            lcd_draw_thick_line(bx + 4, 3, bx, 10, 1, COL_YELLOW);
+            lcd_draw_thick_line(bx, 10, bx + 5, 10, 1, COL_YELLOW);
+            lcd_draw_thick_line(bx + 5, 10, bx + 1, 17, 1, COL_YELLOW);
+        }
+    } else {
+        lcd_draw_text(36, 3, "--", 2, COL_DARK_GRAY);
+    }
+    // Bluetooth link dot
+    int r = 5, cx = LCD_W - 12, cy = BAR_H / 2;
+    for (int dy = -r; dy <= r; dy++) {
+        int hw = 0;
+        while ((hw + 1) * (hw + 1) + dy * dy <= r * r) hw++;
+        lcd_fill_rect(cx - hw, cy + dy, cx + hw + 1, cy + dy + 1,
+                      g_bar_ble ? COL_CYAN : COL_DARK_GRAY);
+    }
+}
+
+// Cheap hook for draw routines that already hold the mutex.
+static void statusbar_paint_if_dirty(void)
+{
+    if (g_bar_dirty) statusbar_paint();
+}
+
+// Called from the display task: refreshes the readings and repaints on change.
+static void statusbar_tick(void)
+{
+    static TickType_t last_sample = 0;
+    TickType_t now = xTaskGetTickCount();
+    if (last_sample == 0 || (now - last_sample) >= pdMS_TO_TICKS(5000)) {
+        last_sample = now ? now : 1;
+        battery_sample();
+    }
+    g_bar_ble = ble_presenter_connected();
+    if (g_passkey_hold_until != 0) return;      // keep the pairing code unobstructed
+    if (g_bar_dirty || g_batt_pct != g_bar_shown_pct || g_batt_ext != g_bar_shown_ext ||
+        g_bar_ble != g_bar_shown_ble) {
+        xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+        statusbar_paint();
+        xSemaphoreGive(g_pres_lcd_mu);
+    }
+}
+
+// 28x28 menu icons built from rectangles and lines, drawn in colour `c`.
+static void lcd_fill_circle(int cx, int cy, int r, uint16_t c)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        int hw = 0;
+        while ((hw + 1) * (hw + 1) + dy * dy <= r * r) hw++;
+        lcd_fill_rect(cx - hw, cy + dy, cx + hw + 1, cy + dy + 1, c);
+    }
+}
+
+static void lcd_icon_mic(int x, int y, uint16_t c)
+{
+    lcd_fill_rect(x + 10, y + 2, x + 18, y + 16, c);          // capsule
+    lcd_fill_rect(x + 11, y + 1, x + 17, y + 2, c);
+    lcd_fill_rect(x + 11, y + 16, x + 17, y + 17, c);
+    lcd_draw_thick_line(x + 6, y + 11, x + 6, y + 17, 2, c);    // cradle
+    lcd_draw_thick_line(x + 6, y + 17, x + 10, y + 21, 2, c);
+    lcd_draw_thick_line(x + 10, y + 21, x + 18, y + 21, 2, c);
+    lcd_draw_thick_line(x + 18, y + 21, x + 22, y + 17, 2, c);
+    lcd_draw_thick_line(x + 22, y + 17, x + 22, y + 11, 2, c);
+    lcd_draw_thick_line(x + 14, y + 21, x + 14, y + 26, 2, c);  // stem + base
+    lcd_draw_thick_line(x + 9, y + 26, x + 19, y + 26, 2, c);
+}
+
+static void lcd_icon_bluetooth(int x, int y, uint16_t c)
+{
+    static const int8_t pts[][2] = {{6, 19}, {22, 9}, {14, 2}, {14, 26}, {22, 19}, {6, 9}};
+    for (int i = 0; i + 1 < 6; i++) {
+        lcd_draw_thick_line(x + pts[i][0], y + pts[i][1],
+                            x + pts[i + 1][0], y + pts[i + 1][1], 2, c);
+    }
+}
+
+static void lcd_icon_record(int x, int y, uint16_t c, uint16_t bg)
+{
+    lcd_fill_circle(x + 14, y + 14, 13, c);                    // ring
+    lcd_fill_circle(x + 14, y + 14, 10, bg);
+    lcd_fill_circle(x + 14, y + 14, 6, c);                     // dot
+}
+
+static void lcd_icon_slide(int x, int y, uint16_t c)
+{
+    lcd_draw_thick_line(x + 2, y + 14, x + 22, y + 14, 4, c);   // arrow
+    lcd_draw_thick_line(x + 14, y + 5, x + 24, y + 14, 3, c);
+    lcd_draw_thick_line(x + 14, y + 23, x + 24, y + 14, 3, c);
+}
+
+static void lcd_menu_icon(vox_mode_t m, int x, int y, uint16_t fg, uint16_t bg)
+{
+    switch (m) {
+    case MODE_DICT_USB:  lcd_icon_mic(x, y, fg); break;
+    case MODE_DICT_BLE:  lcd_icon_bluetooth(x, y, fg); break;
+    case MODE_BT_REC:    lcd_icon_record(x, y, fg, bg); break;
+    case MODE_PRESENTER: lcd_icon_slide(x, y, fg); break;
+    default: break;
+    }
+}
+
 static void lcd_draw_menu(int sel)
 {
     if (!g_lcd) return;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    const int gap = 6, margin = 3, scale = 3;
-    const int row_h = (LCD_H - 2 * margin - gap * (MENU_ITEMS - 1)) / MENU_ITEMS;
+    const int gap = 6, margin = 3, scale = 2;
+    const int top = BAR_H + margin;
+    const int row_h = (LCD_H - top - margin - gap * (MENU_ITEMS - 1)) / MENU_ITEMS;
     for (int i = 0; i < MENU_ITEMS; i++) {
-        int y = margin + i * (row_h + gap);
+        int y = top + i * (row_h + gap);
         bool on = (i == sel);
         uint16_t col = k_menu[i].col;
         if (on) {
@@ -510,10 +649,12 @@ static void lcd_draw_menu(int sel)
             lcd_fill_rect(LCD_W - margin - 2, y, LCD_W - margin, y + row_h, col);
         }
         uint16_t fg = on ? COL_BLACK : col;
-        const char *l1 = k_menu[i].l1;
-        lcd_draw_text((LCD_W - lcd_text_width(l1, scale)) / 2,
-                      y + (row_h - 7 * scale) / 2, l1, scale, fg);
+        uint16_t bg = on ? col : COL_BLACK;
+        lcd_menu_icon(k_menu[i].mode, margin + 6, y + (row_h - 28) / 2, fg, bg);
+        lcd_draw_text(margin + 6 + 28 + 8, y + (row_h - 7 * scale) / 2,
+                      k_menu[i].l1, scale, fg);
     }
+    statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -528,8 +669,9 @@ static void lcd_draw_ble_dictation(void)
     lcd_draw_text((LCD_W - lcd_text_width("MIC", 5)) / 2, 140, "MIC", 5, col);
     int st = ble_presenter_state();
     uint16_t sc = st >= 90 ? COL_RED : (st == 6 ? COL_GREEN : COL_YELLOW);
-    if (st >= 10) lcd_draw_digit(10, 10, st / 10, sc);
-    lcd_draw_digit(st >= 10 ? 34 : 10, 10, st % 10, sc);
+    if (st >= 10) lcd_draw_digit(10, 26, st / 10, sc);
+    lcd_draw_digit(st >= 10 ? 34 : 10, 26, st % 10, sc);
+    statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -540,6 +682,7 @@ static void lcd_clear_locked(void)
     if (!g_lcd) return;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
+    statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -554,11 +697,12 @@ static void lcd_draw_btrec(int ui)
     if (ui < 0 || ui >= (int)(sizeof(k) / sizeof(k[0]))) ui = 0;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    lcd_draw_text((LCD_W - lcd_text_width("BT REC", 3)) / 2, 24, "BT REC", 3, COL_LIGHT_GRAY);
+    lcd_draw_text((LCD_W - lcd_text_width("BT REC", 3)) / 2, 34, "BT REC", 3, COL_LIGHT_GRAY);
     int scale = 8;
     while (scale > 1 && lcd_text_width(k[ui].word, scale) > LCD_W - 8) scale--;
     lcd_draw_text((LCD_W - lcd_text_width(k[ui].word, scale)) / 2,
                   (LCD_H - 7 * scale) / 2, k[ui].word, scale, k[ui].col);
+    statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -632,6 +776,7 @@ static void vad_lcd_task(void *arg)
     while (1) {
         vox_mode_t mode = g_mode;
         int sel = g_menu_sel;
+        statusbar_tick();
 
         if (mode == MODE_MENU) {
             if (last_mode != (int)mode || last_sel != sel) {
@@ -829,6 +974,50 @@ static esp_err_t pmic_write(uint8_t reg, uint8_t val)
     ret = i2c_master_transmit(dev, buf, sizeof(buf), 100);
     i2c_master_bus_rm_device(dev);
     return ret;
+}
+
+// Battery: M5PM1 VBAT = reg 0x22 (low byte) + 0x23 (low 4 bits), in mV; PWR_SRC
+// reg 0x04 is 0 when running from the USB 5V input (register map: m5stack/M5PM1).
+// The chip has no charge-complete flag, so "USB powered" stands in for charging.
+static esp_err_t pmic_read_n(uint8_t reg, uint8_t *out, size_t n)
+{
+    if (g_pmic_addr == 0) return ESP_ERR_NOT_FOUND;
+    i2c_master_dev_handle_t dev = NULL;
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = g_pmic_addr,
+        .scl_speed_hz    = 100000,
+    };
+    esp_err_t ret = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
+    if (ret != ESP_OK) return ret;
+    ret = i2c_master_transmit_receive(dev, &reg, 1, out, n, 100);
+    i2c_master_bus_rm_device(dev);
+    return ret;
+}
+
+static void battery_sample(void)
+{
+    uint8_t v[2] = {0}, src = 0xFF;
+    if (pmic_read_n(0x22, v, 2) != ESP_OK) { g_batt_pct = -1; return; }
+    int mv = v[0] | ((v[1] & 0x0F) << 8);
+    if (pmic_read_n(0x04, &src, 1) != ESP_OK) src = 0xFF;
+    // Measured on a StickS3: VIN reads ~1100 mV with a cable in and 0 on battery
+    // (not the real 5 V, so the ADC is scaled), 5VINOUT ~960 vs ~20, and PWR_SRC
+    // 5 vs 4. The input voltage separates the two cleanly.
+    uint8_t w[4] = {0};
+    int vin = 0, vio = 0;
+    if (pmic_read_n(0x24, w, 4) == ESP_OK) {
+        vin = w[0] | ((w[1] & 0x0F) << 8);
+        vio = w[2] | ((w[3] & 0x0F) << 8);
+    }
+    g_batt_ext = (vin > 500 || vio > 500);
+    if (mv < 2500 || mv > 4600) { g_batt_pct = -1; }       // implausible: show "--"
+    else {
+        int pct = (mv - 3300) * 100 / (4150 - 3350);
+        g_batt_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    }
+    ESP_LOGI(TAG, "battery %d mV -> %d%%, pwr_src=%u vin=%d vio=%d ext=%d",
+             mv, g_batt_pct, (unsigned)src, vin, vio, (int)g_batt_ext);
 }
 
 // M5StickS3's M5PM1 always sits at 0x6E (verified across builds; the
@@ -1583,6 +1772,8 @@ static void button_task(void *arg)
                     ESP_LOGI(TAG, "menu selection -> %d", (int)g_menu_sel);
                 } else if (g_mode == MODE_BT_REC) {
                     if (!btmic_recording()) enter_mode(MODE_MENU);   // side button = back
+                } else if (g_mode == MODE_DICT_USB || g_mode == MODE_DICT_BLE) {
+                    enter_mode(MODE_MENU);                           // side button = back
                 } else if (g_mode == MODE_PRESENTER) {
                     ESP_LOGI(TAG, "btn B down (prev slide)");
                     if (!ble_presenter_send_key(HID_KEY_LEFT_ARROW)) {
