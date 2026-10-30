@@ -1,0 +1,7 @@
+# Same as PARTITION_TABLE_SINGLE_APP_LARGE for the first three entries (so NVS and
+# the BLE bonds stay where they were), plus a raw recording store for BT REC.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x177000
+inbox,    data, 0x40,    0x190000, 0x300000

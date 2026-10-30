@@ -1,13 +1,27 @@
 #include "btmic.h"
+#include "inbox.h"
 
 #include <string.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 
 static const char *TAG = "btmic";
+
+// Survives a watchdog or panic reset so the next boot can show where it died.
+RTC_NOINIT_ATTR volatile uint32_t vox_crumb;
+volatile uint32_t vox_hb_rec = 0;                   // bumped by the recording/upload task; the monitor watches it
+static volatile bool s_link_ok = false;            // cached; refreshed only by the recording task
+static volatile int  s_last_rc = 0;                // last notify error, for the NOTE screen
+
+// Why the last upload attempt ended: 1 read failed, 2 send failed, 3 link lost,
+// 4 user started recording, 5 acknowledged, 6 answer timed out, 7 left NOTE.
+static volatile uint8_t  s_sync_reason = 0;
+static volatile uint16_t s_sync_tries = 0;
+static TickType_t        s_sync_retry_at = 0;      // back-off after a failure
 
 // 5e3b0000-8a7c-4f1e-9b2d-7c4a1f0e6d10 (little-endian bytes; n = last group byte).
 #define VOX_UUID(n) BLE_UUID128_INIT(0x10, 0x6d, 0x0e, 0x1f, 0x4a, 0x7c, 0x2d, 0x9b, \
@@ -25,7 +39,9 @@ static const ble_uuid128_t k_ctrl_uuid  = VOX_UUID(0x02);
 #define BUSY_HOLD_MS      60000                    // BUSY lasts until DONE/ERR (or this)
 
 enum { TYPE_AUDIO = 1, TYPE_END = 2, TYPE_START = 3 };
-enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3 };
+enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3, CTRL_FULL = 4 /* local only */, CTRL_PING = 5 };
+#define PEER_ALIVE_MS     6000                     // no heartbeat for this long = no Mac listening
+#define FLAG_OFFLINE      0x01                     // frame header byte 7: stored recording
 
 static uint16_t          s_audio_handle;
 static volatile uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -36,6 +52,14 @@ static volatile TickType_t s_ctrl_until = 0;
 static uint16_t          s_session = 0;
 static btmic_read_fn     s_reader = NULL;
 static TaskHandle_t      s_task = NULL;
+static volatile bool     s_sync_ok = false;        // BT REC screen is up: uploads allowed
+static volatile bool     s_maint_ok = false;       // idle screens: flash housekeeping allowed
+static volatile bool     s_syncing = false;
+static volatile bool     s_rec_offline = false;
+static volatile bool     s_ping_seen = false;      // heartbeat from the Mac helper
+static volatile TickType_t s_last_ping = 0;
+static volatile uint16_t s_ctrl_session = 0;       // session the last DONE/ERR/BUSY refers to (0 = unknown)
+#define ACK_WAIT_MS       90000                    // Mac needs this long at most per recording
 
 // ---- IMA ADPCM -------------------------------------------------------------
 static const int16_t k_step[89] = {
@@ -82,9 +106,21 @@ static int ctrl_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
 {
     (void)conn; (void)attr; (void)arg;
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
-    uint8_t b = 0;
-    if (OS_MBUF_PKTLEN(ctxt->om) < 1 || os_mbuf_copydata(ctxt->om, 0, 1, &b) != 0) return 0;
+    // [status] or [status, session lo, session hi]
+    uint8_t buf[3] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len < 1) return 0;
+    if (len > sizeof(buf)) len = sizeof(buf);
+    if (os_mbuf_copydata(ctxt->om, 0, len, buf) != 0) return 0;
+    uint8_t b = buf[0];
+    uint16_t sess = len >= 3 ? (uint16_t)(buf[1] | (buf[2] << 8)) : 0;
+    if (b == CTRL_PING) {
+        s_last_ping = xTaskGetTickCount();
+        s_ping_seen = true;
+        return 0;
+    }
     if (b == CTRL_BUSY || b == CTRL_DONE || b == CTRL_ERR) {
+        s_ctrl_session = sess;
         s_ctrl_status = b;
         s_ctrl_until = xTaskGetTickCount() +
                        pdMS_TO_TICKS(b == CTRL_BUSY ? BUSY_HOLD_MS : STATUS_HOLD_MS);
@@ -132,34 +168,53 @@ void btmic_on_subscribe(uint16_t conn_handle, uint16_t attr_handle, uint8_t cur_
 
 void btmic_on_disconnect(void)
 {
+    s_link_ok = false;
     s_sub = false;
+    s_ping_seen = false;
     s_recording = false;
     s_conn = BLE_HS_CONN_HANDLE_NONE;
 }
 
-// The link is usable only when subscribed, encrypted and the MTU fits a frame.
-static bool link_ready(void)
+// The link is usable only when subscribed, encrypted, the MTU fits a frame, and
+// the Mac helper is actually alive. macOS keeps the subscription (and the HID
+// connection) after the helper quits, so the heartbeat is what tells them apart.
+static bool link_compute(void)
 {
     if (!s_sub || s_conn == BLE_HS_CONN_HANDLE_NONE) return false;
+    if (!s_ping_seen || (xTaskGetTickCount() - s_last_ping) > pdMS_TO_TICKS(PEER_ALIVE_MS)) return false;
     struct ble_gap_conn_desc d;
     if (ble_gap_conn_find(s_conn, &d) != 0 || !d.sec_state.encrypted) return false;
     return ble_att_mtu(s_conn) >= MIN_ATT_MTU;
 }
 
-static bool send_frame(const uint8_t *f, size_t n)
+// The display and button tasks must never call into the NimBLE host (ble_gap_*,
+// ble_att_*): it takes the host lock, and the recording task holds that lock
+// while it notifies. They read this cached answer instead.
+static void link_refresh(void) { s_link_ok = link_compute(); }
+static bool link_ready(void)   { return s_link_ok; }
+
+// Live audio gives up quickly (late audio is useless); stored recordings keep
+// retrying so nothing is lost when the radio buffers are momentarily full.
+static bool send_frame_n(const uint8_t *f, size_t n, int max_tries)
 {
-    for (int tries = 0; tries < 4; tries++) {
+    for (int tries = 0; tries < max_tries; tries++) {
         struct os_mbuf *om = ble_hs_mbuf_from_flat(f, n);
-        if (!om) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        if (!om) { vTaskDelay(1)    /* one tick: 5 ms rounds to 0 at 100 Hz, which spins */; continue; }
+        vox_crumb = 34;
         int rc = ble_gatts_notify_custom(s_conn, s_audio_handle, om);   // consumes om
         if (rc == 0) return true;
-        if (rc != BLE_HS_ENOMEM && rc != BLE_HS_EBUSY) return false;
-        vTaskDelay(pdMS_TO_TICKS(5));
+        s_last_rc = rc;
+        vox_crumb = 33;
+        if (rc == BLE_HS_ENOTCONN) return false;       // gone; anything else may clear up
+        vTaskDelay(1)    /* one tick: 5 ms rounds to 0 at 100 Hz, which spins */;
     }
     return false;
 }
 
-static void fill_header(uint8_t *f, uint8_t type, uint16_t seq, const adpcm_t *s)
+static bool send_frame(const uint8_t *f, size_t n)        { return send_frame_n(f, n, 4); }
+static bool send_frame_stored(const uint8_t *f, size_t n) { return send_frame_n(f, n, 400); }   // up to ~2 s
+
+static void fill_header(uint8_t *f, uint8_t type, uint16_t seq, int pred, int idx, uint8_t flags)
 {
     memset(f, 0, HEADER_LEN);
     f[0] = 1;
@@ -167,60 +222,193 @@ static void fill_header(uint8_t *f, uint8_t type, uint16_t seq, const adpcm_t *s
     f[2] = s_session & 0xFF; f[3] = s_session >> 8;
     f[4] = seq & 0xFF;       f[5] = seq >> 8;
     f[6] = 1;                                   // codec: IMA ADPCM 16 kHz mono
-    uint16_t p = (uint16_t)(int16_t)s->pred;
-    f[8] = p & 0xFF; f[9] = p >> 8; f[10] = (uint8_t)s->idx;
+    f[7] = flags;
+    uint16_t p = (uint16_t)(int16_t)pred;
+    f[8] = p & 0xFF; f[9] = p >> 8; f[10] = (uint8_t)idx;
+}
+
+// The end frame carries the final sequence number so the Mac can tell whether
+// anything was lost; repeat it because notifications can drop.
+static void send_end(uint8_t *frame, uint16_t seq, uint8_t flags)
+{
+    for (int i = 0; i < 3; i++) {
+        fill_header(frame, TYPE_END, seq, 0, 0, flags);
+        send_frame(frame, HEADER_LEN);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void record_session(void)
+{
+    vox_crumb = 10;
+    static int16_t pcm[SAMPLES_PER_FRAME];
+    uint8_t frame[FRAME_LEN];
+    bool off = s_rec_offline;
+    uint8_t flags = off ? FLAG_OFFLINE : 0;
+    adpcm_t st = {0, 0};
+    uint16_t seq = 0;
+    int dropped = 0;
+
+    if (off) {
+        if (!inbox_begin()) { s_recording = false; return; }
+    } else {
+        s_session++;
+        fill_header(frame, TYPE_START, seq++, 0, 0, flags);
+        if (!send_frame(frame, HEADER_LEN)) dropped++;
+    }
+    const uint16_t max_frames = off ? INBOX_MAX_FRAMES : MAX_FRAMES;
+
+    while (s_recording && seq < max_frames) {
+        vox_hb_rec++;
+        if (!off && (seq & 15) == 0) link_refresh();
+        int n = s_reader ? s_reader(pcm, SAMPLES_PER_FRAME) : -1;
+        if (n < 0) { ESP_LOGW(TAG, "mic read failed"); break; }
+        for (int i = n; i < SAMPLES_PER_FRAME; i++) pcm[i] = 0;
+        int pred0 = st.pred, idx0 = st.idx;
+        uint8_t *data = frame + HEADER_LEN;
+        for (int i = 0; i < SAMPLES_PER_FRAME / 2; i++) {
+            uint8_t lo = adpcm_encode(pcm[2 * i], &st);
+            uint8_t hi = adpcm_encode(pcm[2 * i + 1], &st);
+            data[i] = lo | (hi << 4);
+        }
+        if (off) {
+            if (!inbox_append((int16_t)pred0, (uint8_t)idx0, data)) { ESP_LOGW(TAG, "flash write failed"); dropped++; break; }
+            seq++;
+        } else {
+            fill_header(frame, TYPE_AUDIO, seq++, pred0, idx0, flags);
+            if (!send_frame(frame, FRAME_LEN)) dropped++;
+        }
+    }
+    s_recording = false;
+    vox_crumb = 12;
+
+    if (off) {
+        bool ok = inbox_finish();
+        ESP_LOGI(TAG, "offline recording %s: %u frames", ok ? "saved" : "discarded", seq);
+    } else {
+        send_end(frame, seq, flags);
+        ESP_LOGI(TAG, "session %u: %u frames, %d dropped", s_session, seq, dropped);
+    }
+}
+
+// Uploads the oldest stored recording. Returns when it is acknowledged, the
+// link goes away, or the user starts recording (the slot then stays queued).
+static void sync_fail(uint8_t reason)
+{
+    s_syncing = false;
+    s_sync_reason = reason;
+    s_sync_retry_at = xTaskGetTickCount() + pdMS_TO_TICKS(5000);   // no retry storms
+}
+
+static void sync_step(void)
+{
+    if (!s_sync_ok || s_recording || !link_ready() || inbox_pending() == 0) { s_syncing = false; return; }
+    if ((int32_t)(xTaskGetTickCount() - s_sync_retry_at) < 0) return;
+    if (s_ctrl_status == CTRL_BUSY && (int32_t)(xTaskGetTickCount() - s_ctrl_until) < 0) return;   // Mac is busy
+    int slot; uint32_t nf;
+    if (!inbox_oldest(&slot, &nf)) { s_syncing = false; return; }
+
+    static uint8_t frame[FRAME_LEN];
+    vox_crumb = 30;
+    s_syncing = true;
+    s_sync_tries++;
+    s_session++;
+    s_ctrl_status = 0;
+    s_ctrl_session = 0;
+    uint16_t seq = 0;
+    fill_header(frame, TYPE_START, seq++, 0, 0, FLAG_OFFLINE);
+    if (!send_frame_stored(frame, HEADER_LEN)) { sync_fail(2); return; }
+    for (uint32_t i = 0; i < nf; i++) {
+        vox_hb_rec++;
+        if ((i & 15) == 0) link_refresh();
+        if (s_recording) { sync_fail(4); return; }
+        if (!link_ready()) { sync_fail(3); return; }
+        int16_t pred; uint8_t idx;
+        if (!inbox_read(slot, i, &pred, &idx, frame + HEADER_LEN)) { sync_fail(1); return; }
+        fill_header(frame, TYPE_AUDIO, seq++, pred, idx, FLAG_OFFLINE);
+        if (!send_frame_stored(frame, FRAME_LEN)) { sync_fail(2); return; }   // link trouble: keep it queued
+        vTaskDelay(pdMS_TO_TICKS(15));           // a little faster than real time
+    }
+    vox_crumb = 31;
+    send_end(frame, seq, FLAG_OFFLINE);
+
+    TickType_t until = xTaskGetTickCount() + pdMS_TO_TICKS(ACK_WAIT_MS);
+    uint8_t why = 6;
+    while ((int32_t)(xTaskGetTickCount() - until) < 0) {
+        // Only an answer for this very session counts; anything else (a live
+        // result, an old reply) must not delete a recording the Mac never got.
+        if ((s_ctrl_status == CTRL_DONE || s_ctrl_status == CTRL_ERR) && s_ctrl_session == s_session) {
+            vox_crumb = 32;
+            inbox_delete(slot);
+            ESP_LOGI(TAG, "slot %d uploaded", slot);
+            s_syncing = false;
+            s_sync_reason = 5;
+            return;
+        }
+        vox_hb_rec++;
+        link_refresh();
+        if (s_recording) { why = 4; break; }
+        if (!s_sync_ok) { why = 7; break; }
+        if (!link_ready()) { why = 3; break; }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    sync_fail(why);
 }
 
 static void rec_task(void *arg)
 {
     (void)arg;
-    static int16_t pcm[SAMPLES_PER_FRAME];
-    uint8_t frame[FRAME_LEN];
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (!s_recording) continue;
-        s_session++;
-        uint16_t seq = 0;
-        adpcm_t st = {0, 0};
-        int dropped = 0;
-
-        fill_header(frame, TYPE_START, seq++, &st);
-        if (!send_frame(frame, HEADER_LEN)) dropped++;
-
-        while (s_recording && seq < MAX_FRAMES) {
-            int n = s_reader ? s_reader(pcm, SAMPLES_PER_FRAME) : -1;
-            if (n < 0) { ESP_LOGW(TAG, "mic read failed"); break; }
-            for (int i = n; i < SAMPLES_PER_FRAME; i++) pcm[i] = 0;
-            fill_header(frame, TYPE_AUDIO, seq++, &st);
-            for (int i = 0; i < SAMPLES_PER_FRAME / 2; i++) {
-                uint8_t lo = adpcm_encode(pcm[2 * i], &st);
-                uint8_t hi = adpcm_encode(pcm[2 * i + 1], &st);
-                frame[HEADER_LEN + i] = lo | (hi << 4);
-            }
-            if (!send_frame(frame, FRAME_LEN)) dropped++;
+        vox_hb_rec++;
+        link_refresh();
+        // Short idle tick while there is erasing to do or a Mac to talk to, slow otherwise.
+        TickType_t wait = (s_maint_ok && inbox_maintain_needed()) ? pdMS_TO_TICKS(60) : pdMS_TO_TICKS(1000);
+        if (s_sub && wait > pdMS_TO_TICKS(200)) wait = pdMS_TO_TICKS(200);
+        if (ulTaskNotifyTake(pdTRUE, wait) == 0) {
+            if (s_maint_ok && !s_recording) { vox_crumb = 20; inbox_maintain(); }
+            vox_crumb = 0;
+            sync_step();
+            continue;
         }
-        s_recording = false;
-
-        // The end frame carries the final sequence number so the Mac can tell
-        // whether anything was lost; repeat it because notifications can drop.
-        for (int i = 0; i < 3; i++) {
-            fill_header(frame, TYPE_END, seq, &st);
-            send_frame(frame, HEADER_LEN);
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        ESP_LOGI(TAG, "session %u: %u frames, %d dropped", s_session, seq, dropped);
+        if (s_recording) record_session();
     }
 }
 
 void btmic_init(btmic_read_fn reader)
 {
     s_reader = reader;
-    if (!s_task) xTaskCreate(rec_task, "btmic", 4096, NULL, 5, &s_task);
+    inbox_init();
+    if (!s_task) xTaskCreate(rec_task, "btmic", 6144, NULL, 5, &s_task);
 }
 
-bool btmic_start(void)
+void btmic_set_mode(bool sync_ok, bool maintain_ok)
 {
-    if (s_recording || !s_task || !link_ready()) return false;
+    s_sync_ok = sync_ok;
+    s_maint_ok = maintain_ok;
+}
+
+int btmic_pending(void) { return inbox_pending(); }
+
+// "S<reason>-<tries>" for the NOTE screen: why the last upload ended and how many were attempted.
+void btmic_debug(char *buf, size_t n)
+{
+    snprintf(buf, n, "S%u-%u R%d", (unsigned)s_sync_reason, (unsigned)(s_sync_tries % 100), s_last_rc);
+}
+
+bool btmic_start(bool offline)
+{
+    if (s_recording || !s_task) return false;
+    if (offline) {
+        if (!inbox_has_free()) {                 // no erased slot (yet)
+            s_ctrl_status = CTRL_FULL;
+            s_ctrl_until = xTaskGetTickCount() + pdMS_TO_TICKS(STATUS_HOLD_MS);
+            return false;
+        }
+        s_rec_offline = true;
+    } else {
+        if (!link_ready()) return false;         // live needs the Mac helper listening
+        s_rec_offline = false;
+    }
     s_ctrl_status = 0;
     s_recording = true;
     xTaskNotifyGive(s_task);
@@ -239,13 +427,15 @@ bool btmic_recording(void)
 
 btmic_ui_t btmic_ui_state(void)
 {
-    if (s_recording) return BTMIC_UI_REC;
+    if (s_recording) return s_rec_offline ? BTMIC_UI_REC_OFF : BTMIC_UI_REC;
     if (s_ctrl_status != 0 && (int32_t)(xTaskGetTickCount() - s_ctrl_until) < 0) {
         switch (s_ctrl_status) {
         case CTRL_BUSY: return BTMIC_UI_BUSY;
         case CTRL_DONE: return BTMIC_UI_DONE;
+        case CTRL_FULL: return BTMIC_UI_FULL;
         default:        return BTMIC_UI_ERR;
         }
     }
+    if (s_syncing) return BTMIC_UI_SYNC;
     return link_ready() ? BTMIC_UI_READY : BTMIC_UI_NOLINK;
 }

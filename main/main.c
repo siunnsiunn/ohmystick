@@ -49,6 +49,8 @@
 #include "vox_config.h"
 #include "ble_presenter.h"
 #include "btmic.h"
+#include "launcher.h"
+#include "ui.h"
 
 // Set to 1 to skip TinyUSB / UAC init - keeps USB-Serial/JTAG console
 // alive on /dev/cu.usbmodem* so we can read ESP_LOG output. Diagnostic
@@ -106,8 +108,6 @@ static const char *TAG = "voxstick";
 #define LCD_CS_PIN        41
 #define LCD_SCK_PIN       40
 #define LCD_MOSI_PIN      39
-#define LCD_W             135
-#define LCD_H             240
 #define LCD_BL_LEDC_MODE      LEDC_LOW_SPEED_MODE
 #define LCD_BL_LEDC_TIMER     LEDC_TIMER_0
 #define LCD_BL_LEDC_CHANNEL   LEDC_CHANNEL_0
@@ -121,19 +121,6 @@ static const char *TAG = "voxstick";
 // 16-bit RGB565 colors for low-power status drawing. Runtime leaves most
 // pixels black and keeps the backlight dim; the user still gets a clear mic
 // open / muted signal without lighting the whole LCD.
-#define COL_BLACK         0x0000
-#define COL_WHITE         0xFFFF
-#define COL_RED           0xF800
-#define COL_GREEN         0x07E0
-#define COL_BLUE          0x001F
-#define COL_YELLOW        0xFFE0
-#define COL_CYAN          0x07FF
-#define COL_MAGENTA       0xF81F
-#define COL_ORANGE        0xFD20
-#define COL_DIM_RED       0x4000
-#define COL_DIM_CYAN      0x0210
-#define COL_DARK_GRAY     0x0841
-#define COL_LIGHT_GRAY    0xBDF7
 
 // ---- Audio format (must match sdkconfig CONFIG_UAC_*) --------------------
 #define AUDIO_SAMPLE_RATE  16000
@@ -180,46 +167,46 @@ static volatile bool            g_vad_display_enabled = false;
 static volatile bool            g_imu_mute  = false;
 
 // Presenter mode: button sends slide keys and the mic is forced silent.
-// Always false at boot; toggled only by a very long press (see button_task).
-// Device modes. The device boots into the menu; KEY2 (side) moves the highlight,
-// BtnA (front) enters the highlighted mode, holding BtnA returns to the menu.
-typedef enum {
-    MODE_MENU = 0,
-    MODE_DICT_USB,      // dictation, USB microphone + USB HID keys
-    MODE_DICT_BLE,      // dictation remote: BLE HID keys trigger the host's own mic
-    MODE_BT_REC,        // hold BtnA: stick mic streams over BLE to the Mac helper (btmic)
-    MODE_PRESENTER,     // slide keys (BLE first, USB fallback)
-} vox_mode_t;
+// The device boots into the launcher menu. The side button (KEY2) moves the
+// highlight and the front button (BtnA) opens the app; apps decide what the
+// buttons do from then on (see launcher.h).
+static const app_t *launcher_app(int i);       // the app table, defined below
+static int          launcher_count(void);
 
-typedef struct {
-    const char *l1, *l2;     // two short ASCII lines (no CJK font on device)
-    uint16_t    col;
-    vox_mode_t  mode;
-} menu_item_t;
+// Task monitor: each task bumps its counter every loop and records, in `where`,
+// which call it is inside (0 = idle). A stall restarts the stick and the next
+// boot shows the markers (see monitor_task).
+#include "esp_attr.h"
+RTC_NOINIT_ATTR volatile uint8_t  vox_where_disp;
+RTC_NOINIT_ATTR volatile uint8_t  vox_where_btn;
+RTC_NOINIT_ATTR volatile uint32_t vox_stall_magic;
+RTC_NOINIT_ATTR volatile char     vox_holder[5];     // who held the LCD lock at the stall
+RTC_NOINIT_ATTR volatile uint8_t  vox_stuck_mask;    // bit0 display, bit1 button, bit2 recording
+static volatile uint32_t g_hb_disp = 0, g_hb_btn = 0;
 
-static const menu_item_t k_menu[] = {
-    { "USB MIC", "", COL_CYAN,    MODE_DICT_USB  },
-    { "BT MIC",  "", COL_GREEN,   MODE_DICT_BLE  },
-    { "BT REC",  "", COL_MAGENTA, MODE_BT_REC    },
-    { "SLIDE",   "", COL_ORANGE,  MODE_PRESENTER },
-};
-#define MENU_ITEMS ((int)(sizeof(k_menu) / sizeof(k_menu[0])))
-
-static volatile vox_mode_t g_mode     = MODE_MENU;
+static const app_t *volatile g_cur = NULL;    // NULL = the menu
+static volatile TickType_t g_last_activity = 0;   // buttons / UI changes; drives screen sleep
 static volatile int        g_menu_sel = 0;
 
-static void enter_mode(vox_mode_t m)
+static void enter_app(const app_t *a)
 {
-    g_mode = m;
-    ESP_LOGW(TAG, "mode -> %d", (int)m);
-    if (m == MODE_PRESENTER || m == MODE_DICT_BLE || m == MODE_BT_REC) {
-        ble_presenter_start_async();   // radio on only after an explicit choice
+    const app_t *old = g_cur;
+    if (old && old->leave) old->leave();
+    g_cur = a;
+    g_last_activity = xTaskGetTickCount();
+    uint32_t f = a ? a->flags : 0;
+    btmic_set_mode((f & APP_SYNC) != 0, a == NULL || (f & APP_MAINT) != 0);
+    ESP_LOGW(TAG, "app -> %s", a ? a->name : "MENU");
+    if (a) {
+        if (f & APP_BLE) ble_presenter_start_async();   // radio on only after an explicit choice
+        if (a->enter) a->enter();
     }
 }
 
 static bool effective_mic_muted(void)
 {
-    return g_mode != MODE_DICT_USB || g_uac_muted || (vox_config_flat_mute_enabled() && g_imu_mute);
+    const app_t *a = g_cur;
+    return !(a && (a->flags & APP_USB_MIC)) || g_uac_muted || (vox_config_flat_mute_enabled() && g_imu_mute);
 }
 
 // =========================================================================
@@ -456,7 +443,7 @@ static SemaphoreHandle_t g_pres_lcd_mu = NULL;
 static void lcd_draw_digit(int x, int y, int d, uint16_t col);
 
 // Tiny 5x7 text for menu labels. Column-major, bit0 = top row.
-static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY0123456789%-";
+static const char    k_font_chars[] = "ABCDEGHIKLMNOPRSTUY0123456789%-FVWQ";
 static const uint8_t k_font[][5] = {
     {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
     {0x7F,0x41,0x41,0x22,0x1C}, {0x7F,0x49,0x49,0x49,0x41}, {0x3E,0x41,0x49,0x49,0x7A},
@@ -469,6 +456,8 @@ static const uint8_t k_font[][5] = {
     {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
     {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
     {0x06,0x49,0x49,0x29,0x1E}, {0x23,0x13,0x08,0x64,0x62}, {0x08,0x08,0x08,0x08,0x08},
+    {0x7F,0x09,0x09,0x09,0x01}, {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F},
+    {0x3E,0x41,0x51,0x21,0x5E},
 };
 
 static int lcd_text_width(const char *s, int scale)
@@ -497,7 +486,6 @@ static void lcd_draw_text(int x, int y, const char *s, int scale, uint16_t col)
 }
 
 // ---- Status bar (top 20 px): battery, charging, Bluetooth link ---------------
-#define BAR_H          20
 #define BATT_LOW_PCT   15
 static int           g_batt_pct    = -1;       // -1 = unknown
 static bool          g_batt_ext    = false;    // running from USB power
@@ -506,6 +494,9 @@ static int           g_bar_shown_pct = -2;
 static bool          g_bar_shown_ext = false, g_bar_shown_ble = false;
 
 static void battery_sample(void);              // defined next to the PMIC code
+static int g_fault_reason = 0;                 // esp_reset_reason() if the last reset was abnormal
+static uint32_t g_fault_crumb = 0;
+static char g_fault_who[12] = "";
 
 // Paints the bar. The caller must hold g_pres_lcd_mu (or be the only drawer).
 static void statusbar_paint(void)
@@ -533,7 +524,14 @@ static void statusbar_paint(void)
             lcd_draw_thick_line(bx + 5, 10, bx + 1, 17, 1, COL_YELLOW);
         }
     } else {
-        lcd_draw_text(36, 3, "--", 2, COL_DARK_GRAY);
+        lcd_draw_text(36, 3, "--", 2, 0x7BEF);
+    }
+    if (g_fault_reason) {                       // died last time: reason, then display/button/rec markers
+        char d[20];
+        snprintf(d, sizeof(d), "R%d C%05u", g_fault_reason % 100, (unsigned)(g_fault_crumb % 100000));
+        lcd_fill_rect(34, 0, 114, BAR_H, COL_BLACK);
+        lcd_draw_text(36, 2, d, 1, COL_RED);
+        lcd_draw_text(36, 11, g_fault_who, 1, COL_RED);
     }
     // Bluetooth link dot
     int r = 5, cx = LCD_W - 12, cy = BAR_H / 2;
@@ -562,8 +560,12 @@ static void statusbar_tick(void)
     }
     g_bar_ble = ble_presenter_connected();
     if (g_passkey_hold_until != 0) return;      // keep the pairing code unobstructed
-    if (g_bar_dirty || g_batt_pct != g_bar_shown_pct || g_batt_ext != g_bar_shown_ext ||
+    // Also repaint every few seconds: anything that draws over the bar by accident heals itself.
+    static TickType_t last_paint = 0;
+    bool stale = (now - last_paint) >= pdMS_TO_TICKS(3000);
+    if (stale || g_bar_dirty || g_batt_pct != g_bar_shown_pct || g_batt_ext != g_bar_shown_ext ||
         g_bar_ble != g_bar_shown_ble) {
+        last_paint = now;
         xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
         statusbar_paint();
         xSemaphoreGive(g_pres_lcd_mu);
@@ -617,29 +619,25 @@ static void lcd_icon_slide(int x, int y, uint16_t c)
     lcd_draw_thick_line(x + 14, y + 23, x + 24, y + 14, 3, c);
 }
 
-static void lcd_menu_icon(vox_mode_t m, int x, int y, uint16_t fg, uint16_t bg)
-{
-    switch (m) {
-    case MODE_DICT_USB:  lcd_icon_mic(x, y, fg); break;
-    case MODE_DICT_BLE:  lcd_icon_bluetooth(x, y, fg); break;
-    case MODE_BT_REC:    lcd_icon_record(x, y, fg, bg); break;
-    case MODE_PRESENTER: lcd_icon_slide(x, y, fg); break;
-    default: break;
-    }
-}
+#define MENU_ROWS 5
 
 static void lcd_draw_menu(int sel)
 {
     if (!g_lcd) return;
+    int n = launcher_count();
+    int rows = n < MENU_ROWS ? n : MENU_ROWS;
+    int first = sel >= rows ? sel - rows + 1 : 0;      // keep the highlight on screen
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    const int gap = 6, margin = 3, scale = 2;
+    const int gap = 4, margin = 3, scale = 2;
     const int top = BAR_H + margin;
-    const int row_h = (LCD_H - top - margin - gap * (MENU_ITEMS - 1)) / MENU_ITEMS;
-    for (int i = 0; i < MENU_ITEMS; i++) {
-        int y = top + i * (row_h + gap);
+    const int row_h = (LCD_H - top - margin - gap * (rows - 1)) / rows;
+    for (int r = 0; r < rows; r++) {
+        int i = first + r;
+        const app_t *a = launcher_app(i);
+        int y = top + r * (row_h + gap);
         bool on = (i == sel);
-        uint16_t col = k_menu[i].col;
+        uint16_t col = a->color;
         if (on) {
             lcd_fill_rect(margin, y, LCD_W - margin, y + row_h, col);
         } else {
@@ -650,15 +648,17 @@ static void lcd_draw_menu(int sel)
         }
         uint16_t fg = on ? COL_BLACK : col;
         uint16_t bg = on ? col : COL_BLACK;
-        lcd_menu_icon(k_menu[i].mode, margin + 6, y + (row_h - 28) / 2, fg, bg);
-        lcd_draw_text(margin + 6 + 28 + 8, y + (row_h - 7 * scale) / 2,
-                      k_menu[i].l1, scale, fg);
+        if (a->icon) a->icon(margin + 6, y + (row_h - 28) / 2, fg, bg);
+        lcd_draw_text(margin + 6 + 28 + 8, y + (row_h - 7 * scale) / 2, a->name, scale, fg);
+    }
+    if (n > rows) {                                    // scroll hints
+        if (first > 0) lcd_fill_rect(LCD_W - 9, top, LCD_W - 3, top + 3, COL_LIGHT_GRAY);
+        if (first + rows < n) lcd_fill_rect(LCD_W - 9, LCD_H - 6, LCD_W - 3, LCD_H - 3, COL_LIGHT_GRAY);
     }
     statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
-// BLE dictation screen: "BT MIC", cyan once the link is up, orange before.
 static void lcd_draw_ble_dictation(void)
 {
     if (!g_lcd) return;
@@ -686,22 +686,51 @@ static void lcd_clear_locked(void)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
-// BT REC screen: one big word for the state (see btmic_ui_t).
-static void lcd_draw_btrec(int ui)
+void ui_lock(void)   { xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY); }
+void ui_unlock(void) { xSemaphoreGive(g_pres_lcd_mu); }
+void ui_fill_rect(int x0, int y0, int x1, int y1, uint16_t c) { lcd_fill_rect(x0, y0, x1, y1, c); }
+void ui_line(int x0, int y0, int x1, int y1, int th, uint16_t c) { lcd_draw_thick_line(x0, y0, x1, y1, th, c); }
+void ui_circle(int cx, int cy, int r, uint16_t c) { lcd_fill_circle(cx, cy, r, c); }
+void ui_clear(uint16_t c) { lcd_clear(c); }
+int  ui_text_width(const char *s, int scale) { return lcd_text_width(s, scale); }
+void ui_text(int x, int y, const char *s, int scale, uint16_t c) { lcd_draw_text(x, y, s, scale, c); }
+
+// Voice screens (WHISPER, NOTE): one big word for the state (see btmic_ui_t), plus how many
+// recordings are waiting on the stick.
+static void lcd_draw_btrec(int ui, bool note)
 {
     static const struct { const char *word; uint16_t col; } k[] = {
-        { "NO LINK", COL_ORANGE }, { "READY", COL_CYAN }, { "REC",  COL_RED },
+        { "NO LINK", COL_ORANGE }, { "READY", COL_CYAN },  { "REC",  COL_RED },
         { "BUSY",    COL_YELLOW }, { "DONE",  COL_GREEN }, { "ERR",  COL_RED },
+        { "REC",     COL_RED },    { "SYNC",  COL_CYAN },  { "FULL", COL_RED },
     };
     if (!g_lcd) return;
     if (ui < 0 || ui >= (int)(sizeof(k) / sizeof(k[0]))) ui = 0;
+    int pending = btmic_pending();
+    const char *title = note ? "NOTE" : "WHISPER";
+    const char *word = k[ui].word;
+    uint16_t wcol = k[ui].col;
+    if (note && (ui == BTMIC_UI_NOLINK || ui == BTMIC_UI_READY)) {   // notes record with or without the Mac
+        word = "READY";
+        wcol = ui == BTMIC_UI_READY ? COL_CYAN : COL_ORANGE;
+    }
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    lcd_draw_text((LCD_W - lcd_text_width("BT REC", 3)) / 2, 34, "BT REC", 3, COL_LIGHT_GRAY);
+    lcd_draw_text((LCD_W - lcd_text_width(title, 3)) / 2, 34, title, 3, COL_LIGHT_GRAY);
     int scale = 8;
-    while (scale > 1 && lcd_text_width(k[ui].word, scale) > LCD_W - 8) scale--;
-    lcd_draw_text((LCD_W - lcd_text_width(k[ui].word, scale)) / 2,
-                  (LCD_H - 7 * scale) / 2, k[ui].word, scale, k[ui].col);
+    while (scale > 1 && lcd_text_width(word, scale) > LCD_W - 8) scale--;
+    lcd_draw_text((LCD_W - lcd_text_width(word, scale)) / 2,
+                  (LCD_H - 7 * scale) / 2, word, scale, wcol);
+    if (note) {                                  // upload diagnostics, small, bottom
+        char d[16];
+        btmic_debug(d, sizeof(d));
+        lcd_draw_text(4, LCD_H - 12, d, 1, 0x7BEF);          // mid grey; COL_DARK_GRAY is near black
+    }
+    if (note && pending > 0 && ui != BTMIC_UI_REC_OFF && ui != BTMIC_UI_REC) {
+        char s[24];
+        snprintf(s, sizeof(s), "%d PENDING", pending % 100);
+        lcd_draw_text((LCD_W - lcd_text_width(s, 2)) / 2, 186, s, 2, COL_YELLOW);
+    }
     statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
@@ -757,113 +786,87 @@ void ble_presenter_show_passkey(uint32_t passkey)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
+// ---- Screen sleep: dim, then off, on the idle screens (menu, BT REC) -----------
+#define SCREEN_DIM_MS   15000
+#define SCREEN_OFF_MS   30000
+#define BL_DUTY_DIM     ((LCD_BL_DUTY_MAX * 3U) / 100U)
+
+static void backlight_set(uint32_t duty)
+{
+    ledc_set_duty(LCD_BL_LEDC_MODE, LCD_BL_LEDC_CHANNEL, duty);
+    ledc_update_duty(LCD_BL_LEDC_MODE, LCD_BL_LEDC_CHANNEL);
+}
+
+// Apps flagged APP_NO_SLEEP and pairing screens never sleep. An app's
+// activity_key changing (a recording started, a result arrived) wakes the screen.
+static void screen_sleep_tick(const app_t *a)
+{
+    static int level = 2;                       // 2 full, 1 dim, 0 off
+    static int last_key = -1;
+    if (a && a->activity_key) {
+        int key = a->activity_key();
+        if (key != last_key) { last_key = key; g_last_activity = xTaskGetTickCount(); }
+    } else {
+        last_key = -1;
+    }
+    bool can_sleep = (a == NULL || !(a->flags & APP_NO_SLEEP)) && g_passkey_hold_until == 0;
+    uint32_t idle = pdTICKS_TO_MS(xTaskGetTickCount() - g_last_activity);
+    int want = !can_sleep ? 2 : (idle >= SCREEN_OFF_MS ? 0 : (idle >= SCREEN_DIM_MS ? 1 : 2));
+    if (want == level) return;
+    level = want;
+    backlight_set(want == 2 ? LCD_BL_DUTY_READY : (want == 1 ? BL_DUTY_DIM : 0));
+}
+
+static const app_t app_bt_dict, app_slide;      // defined with the other apps below
+
 static void vad_lcd_task(void *arg)
 {
     (void)arg;
     g_vad_display_enabled = true;
 
-    bool last_active = false;
-    bool last_codec_ready = false;
-    bool last_muted = false;
-    uint32_t last_bucket = UINT32_MAX;
-
-    bool last_ble_up = false;
-    int  last_ble_st = 0;
-    int  last_mode = -1;
-    int  last_sel  = -1;
-    int  last_ui   = -1;
+    const app_t *last = (const app_t *)-1;      // forces the first paint
+    int last_sel = -1;
 
     while (1) {
-        vox_mode_t mode = g_mode;
+        const app_t *a = g_cur;
         int sel = g_menu_sel;
-        statusbar_tick();
+        g_hb_disp++;
+        // A pairing code stays up until pairing ends. Only the two keyboard screens
+        // clear it themselves; anywhere else it would hide the status bar and block
+        // screen sleep for good.
+        if (g_passkey_hold_until != 0 && a != &app_bt_dict && a != &app_slide) {
+            int s = ble_presenter_state();
+            if (s == 61 || s == 98 || (int32_t)(xTaskGetTickCount() - g_passkey_hold_until) >= 0) {
+                g_passkey_hold_until = 0;
+                lcd_clear_locked();
+                last = (const app_t *)-1;           // repaint this screen from scratch
+            }
+        }
+        vox_where_disp = 1; statusbar_tick();
+        vox_where_disp = 2; screen_sleep_tick(a);
+        vox_where_disp = 3;
 
-        if (mode == MODE_MENU) {
-            if (last_mode != (int)mode || last_sel != sel) {
-                last_mode = (int)mode;
+        if (!a) {
+            if (last != a || last_sel != sel) {
+                last = a;
                 last_sel = sel;
                 lcd_draw_menu(sel);
             }
+            vox_where_disp = 0;
             vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
             continue;
         }
 
-        if (mode == MODE_BT_REC) {
-            int ui = (int)btmic_ui_state();
-            if (last_mode != (int)mode || last_ui != ui) {
-                if (last_mode != (int)mode) lcd_clear_locked();
-                last_mode = (int)mode;
-                last_ui = ui;
-                lcd_draw_btrec(ui);
-            }
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
+        bool first = (last != a);
+        if (first) {
+            last = a;
+            last_sel = -1;
+            lcd_clear_locked();                 // drop the menu colours
         }
-
-        if (mode == MODE_PRESENTER || mode == MODE_DICT_BLE) {
-            // Pairing in progress: leave the passkey up until encryption
-            // succeeds (state 61), fails (98) or 60 s pass.
-            if (g_passkey_hold_until != 0) {
-                int s = ble_presenter_state();
-                bool expired = (int32_t)(xTaskGetTickCount() - g_passkey_hold_until) >= 0;
-                if (s == 61 || s == 98 || expired) {
-                    g_passkey_hold_until = 0;
-                    last_mode = -1;           // repaint
-                } else {
-                    vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
-                    continue;
-                }
-            }
-            bool ble_up = ble_presenter_connected();
-            int ble_st = ble_presenter_state();
-            bool mode_changed = (last_mode != (int)mode);
-            if (last_mode != (int)mode || ble_up != last_ble_up || ble_st != last_ble_st) {
-                last_mode = (int)mode;
-                last_ble_up = ble_up;
-                last_ble_st = ble_st;
-                if (mode_changed) lcd_clear_locked();
-                if (mode == MODE_PRESENTER) lcd_draw_presenter();
-                else                        lcd_draw_ble_dictation();
-            }
-            vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
-            continue;
-        }
-
-        // MODE_DICT_USB
-        if (last_mode != (int)mode) {
-            last_mode = (int)mode;
-            last_bucket = UINT32_MAX;     // force a mic-screen redraw
-            lcd_clear_locked();           // drop the menu colours
-            if (!g_vad_display_enabled) {
-                lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
-            }
-        }
-        if (!g_vad_display_enabled) {
-            vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
-            continue;
-        }
-
-        uint32_t level = g_vad_level;
-        uint32_t capped = level > VAD_FULL_LEVEL ? VAD_FULL_LEVEL : level;
-        bool active = g_vad_active;
-        bool codec_ready = g_codec_ready;
-        bool muted = effective_mic_muted();
-        if (muted || !codec_ready) {
-            capped = 0;
-            active = false;
-        }
-        uint32_t bucket = capped / 240U;
-
-        if (active != last_active || codec_ready != last_codec_ready ||
-            muted != last_muted || bucket != last_bucket) {
-            lcd_draw_mic_status(capped, active, codec_ready, muted);
-            last_active = active;
-            last_codec_ready = codec_ready;
-            last_muted = muted;
-            last_bucket = bucket;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
+        vox_where_disp = 4;
+        uint32_t wait = a->tick ? a->tick(first) : 0;
+        vox_where_disp = 0;
+        vTaskDelay(pdMS_TO_TICKS(wait ? wait : VAD_FRAME_MS));
     }
 }
 
@@ -1746,13 +1749,207 @@ static void hid_send_tap(uint8_t modifier, uint8_t keycode)
     tud_hid_keyboard_report(HID_REPORT_ID_KBD, 0, up);
 }
 
+// =========================================================================
+// Launcher apps. To add one: write its callbacks (here or in its own file),
+// define an app_t, and add it to k_apps below. See launcher.h.
+// =========================================================================
+static vox_config_wire_t g_press_cfg;          // config snapshot taken when BtnA went down
+
+static void icon_mic(int x, int y, uint16_t fg, uint16_t bg)       { (void)bg; lcd_icon_mic(x, y, fg); }
+static void icon_bluetooth(int x, int y, uint16_t fg, uint16_t bg) { (void)bg; lcd_icon_bluetooth(x, y, fg); }
+static void icon_note(int x, int y, uint16_t fg, uint16_t bg)      { lcd_icon_record(x, y, fg, bg); }
+static void icon_slide(int x, int y, uint16_t fg, uint16_t bg)     { (void)bg; lcd_icon_slide(x, y, fg); }
+static void icon_whisper(int x, int y, uint16_t fg, uint16_t bg)   // speech bubble with three dots
+{
+    (void)bg;
+    lcd_fill_rect(x + 1, y + 3, x + 27, y + 5, fg);
+    lcd_fill_rect(x + 1, y + 19, x + 27, y + 21, fg);
+    lcd_fill_rect(x + 1, y + 3, x + 3, y + 21, fg);
+    lcd_fill_rect(x + 25, y + 3, x + 27, y + 21, fg);
+    lcd_draw_thick_line(x + 6, y + 21, x + 6, y + 27, 2, fg);
+    lcd_draw_thick_line(x + 6, y + 27, x + 13, y + 21, 2, fg);
+    for (int k = 0; k < 3; k++) lcd_fill_rect(x + 7 + k * 5, y + 10, x + 10 + k * 5, y + 14, fg);
+}
+
+// Taps or holds of the front button become a key chord; BLE apps try the radio
+// first and fall back to USB so a plugged-in cable still works.
+static void send_keys(bool ble_first, bool slide, bool is_long)
+{
+    uint8_t modifier = is_long ? g_press_cfg.hold_modifier : g_press_cfg.tap_modifier;
+    uint8_t keycode  = is_long ? g_press_cfg.hold_keycode  : g_press_cfg.tap_keycode;
+    if (slide) { modifier = 0; keycode = is_long ? HID_KEY_LEFT_ARROW : HID_KEY_RIGHT_ARROW; }
+    ESP_LOGI(TAG, "front button %s -> 0x%02x+0x%02x", is_long ? "long" : "tap", modifier, keycode);
+    bool via_ble = ble_first && ble_presenter_send_chord(modifier, keycode);
+    if (!via_ble) hid_send_tap(modifier, keycode);
+}
+
+// ---- USB MIC: microphone + keys over the cable --------------------------------
+static uint32_t usb_mic_tick(bool first)
+{
+    static bool last_active = false, last_codec_ready = false, last_muted = false;
+    static uint32_t last_bucket = UINT32_MAX;
+    if (first) {
+        last_bucket = UINT32_MAX;                // force a mic-screen redraw
+        if (!g_vad_display_enabled) lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
+    }
+    if (!g_vad_display_enabled) return VAD_FRAME_MS;
+
+    uint32_t level = g_vad_level;
+    uint32_t capped = level > VAD_FULL_LEVEL ? VAD_FULL_LEVEL : level;
+    bool active = g_vad_active;
+    bool codec_ready = g_codec_ready;
+    bool muted = effective_mic_muted();
+    if (muted || !codec_ready) {
+        capped = 0;
+        active = false;
+    }
+    uint32_t bucket = capped / 240U;
+    if (active != last_active || codec_ready != last_codec_ready ||
+        muted != last_muted || bucket != last_bucket) {
+        lcd_draw_mic_status(capped, active, codec_ready, muted);
+        last_active = active;
+        last_codec_ready = codec_ready;
+        last_muted = muted;
+        last_bucket = bucket;
+    }
+    return VAD_FRAME_MS;
+}
+static void usb_mic_front_down(void) { if (!g_vad_display_enabled) lcd_status(COL_MAGENTA); }
+static void usb_mic_front_up(uint32_t held, bool is_long)
+{
+    (void)held;
+    send_keys(false, false, is_long);
+    if (!g_vad_display_enabled) lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
+}
+
+// ---- BT DICT / SLIDE: BLE keyboard screens -------------------------------------
+static uint32_t ble_screen_tick(bool first, bool slide)
+{
+    static bool last_up = false, force = true;
+    static int last_st = -1;
+    if (first) force = true;
+    // Pairing in progress: leave the passkey up until encryption succeeds (state
+    // 61), fails (98) or 60 s pass.
+    if (g_passkey_hold_until != 0) {
+        int s = ble_presenter_state();
+        bool expired = (int32_t)(xTaskGetTickCount() - g_passkey_hold_until) >= 0;
+        if (s == 61 || s == 98 || expired) {
+            g_passkey_hold_until = 0;
+            lcd_clear_locked();
+            force = true;
+        } else {
+            return VAD_FRAME_MS;
+        }
+    }
+    bool up = ble_presenter_connected();
+    int st = ble_presenter_state();
+    if (force || up != last_up || st != last_st) {
+        force = false; last_up = up; last_st = st;
+        if (slide) lcd_draw_presenter();
+        else       lcd_draw_ble_dictation();
+    }
+    return VAD_FRAME_MS;
+}
+static uint32_t bt_dict_tick(bool first) { return ble_screen_tick(first, false); }
+static uint32_t slide_tick(bool first)   { return ble_screen_tick(first, true); }
+static void bt_dict_front_up(uint32_t held, bool is_long) { (void)held; send_keys(true, false, is_long); }
+static void slide_front_up(uint32_t held, bool is_long)   { (void)held; send_keys(true, true, is_long); }
+static void slide_side_down(void)                         // side button = previous slide
+{
+    ESP_LOGI(TAG, "side button (prev slide)");
+    if (!ble_presenter_send_key(HID_KEY_LEFT_ARROW)) hid_send_tap(0, HID_KEY_LEFT_ARROW);
+}
+
+// ---- WHISPER / NOTE: hold the front button and talk ------------------------------
+static uint32_t voice_tick(bool first, bool note)
+{
+    static int last_key = -1;
+    int ui = (int)btmic_ui_state();
+    int key = ui * 100 + btmic_pending() + (note ? 10000 : 0);
+    if (first || key != last_key) {
+        last_key = key;
+        lcd_draw_btrec(ui, note);
+    }
+    return 50;
+}
+static uint32_t whisper_tick(bool first) { return voice_tick(first, false); }
+static uint32_t note_tick(bool first)    { return voice_tick(first, true); }
+static int  voice_activity(void)         { return (int)btmic_ui_state() * 100 + btmic_pending(); }
+static void whisper_front_down(void)     { btmic_start(false); }   // live: needs the Mac listening
+static void note_front_down(void)        { btmic_start(true); }    // stored on the stick
+static void voice_front_up(uint32_t held, bool is_long) { (void)held; (void)is_long; btmic_stop(); }
+static void voice_side_down(void)        { if (!btmic_recording()) enter_app(NULL); }
+
+static const app_t app_usb_mic = {
+    .name = "USB MIC", .color = COL_CYAN, .icon = icon_mic,
+    .flags = APP_NO_SLEEP | APP_USB_MIC | APP_HOLD_EXITS,
+    .tick = usb_mic_tick, .front_down = usb_mic_front_down, .front_up = usb_mic_front_up,
+};
+static const app_t app_bt_dict = {
+    .name = "BT DICT", .color = COL_GREEN, .icon = icon_bluetooth,
+    .flags = APP_NO_SLEEP | APP_BLE | APP_HOLD_EXITS,
+    .tick = bt_dict_tick, .front_up = bt_dict_front_up,
+};
+static const app_t app_whisper = {
+    .name = "WHISPER", .color = COL_MAGENTA, .icon = icon_whisper,
+    .flags = APP_BLE,
+    .tick = whisper_tick, .activity_key = voice_activity,
+    .front_down = whisper_front_down, .front_up = voice_front_up, .side_down = voice_side_down,
+};
+static const app_t app_note = {
+    .name = "NOTE", .color = COL_YELLOW, .icon = icon_note,
+    .flags = APP_BLE | APP_SYNC | APP_MAINT,
+    .tick = note_tick, .activity_key = voice_activity,
+    .front_down = note_front_down, .front_up = voice_front_up, .side_down = voice_side_down,
+};
+static const app_t app_slide = {
+    .name = "SLIDE", .color = COL_ORANGE, .icon = icon_slide,
+    .flags = APP_NO_SLEEP | APP_BLE | APP_HOLD_EXITS,
+    .tick = slide_tick, .front_up = slide_front_up, .side_down = slide_side_down,
+};
+
+static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide };
+static const app_t *launcher_app(int i)  { return k_apps[i]; }
+static int          launcher_count(void) { return (int)(sizeof(k_apps) / sizeof(k_apps[0])); }
+
+// Restarts the stick if the display, button or recording task stops reporting in
+// (a deadlock or a hung call), after saving where each one was.
+static void monitor_task(void *arg)
+{
+    (void)arg;
+    uint32_t last[3] = {0, 0, 0};
+    int stuck[3] = {0, 0, 0};
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        uint32_t now[3] = { g_hb_disp, g_hb_btn, vox_hb_rec };
+        bool dead = false;
+        for (int i = 0; i < 3; i++) {
+            stuck[i] = (now[i] == last[i]) ? stuck[i] + 1 : 0;
+            last[i] = now[i];
+            if (stuck[i] >= 6) dead = true;
+        }
+        if (dead) {
+            TaskHandle_t h = g_pres_lcd_mu ? xSemaphoreGetMutexHolder(g_pres_lcd_mu) : NULL;
+            const char *nm = h ? pcTaskGetName(h) : "-";
+            for (int i = 0; i < 4; i++) vox_holder[i] = nm[i] ? nm[i] : ' ';
+            vox_holder[4] = 0;
+            vox_stuck_mask = (stuck[0] >= 6) | ((stuck[1] >= 6) << 1) | ((stuck[2] >= 6) << 2);
+            vox_stall_magic = 0xBEEF;
+            ESP_LOGE(TAG, "stalled: disp=%d btn=%d rec=%d where d=%u b=%u r=%u",
+                     stuck[0], stuck[1], stuck[2], (unsigned)vox_where_disp,
+                     (unsigned)vox_where_btn, (unsigned)vox_crumb);
+            esp_restart();
+        }
+    }
+}
+
 static void button_task(void *arg)
 {
+    (void)arg;
     bool a_committed = true;     // released = high
     bool a_pending   = true;
     int  a_stable    = 0;
     TickType_t a_press_start = 0;
-    vox_config_wire_t a_press_cfg = {0};
     bool       a_long_latched = false;  // true once the press has crossed
                                         // the long threshold this hold
 
@@ -1761,24 +1958,26 @@ static void button_task(void *arg)
     int  b_stable    = 0;
 
     while (1) {
+        g_hb_btn++;
+        vox_where_btn = 0;
+        if (!gpio_get_level(BTN_A_GPIO) || !gpio_get_level(BTN_B_GPIO)) {
+            g_last_activity = xTaskGetTickCount();     // wakes a sleeping screen
+        }
         bool b = gpio_get_level(BTN_B_GPIO);
         if (b != b_pending) { b_pending = b; b_stable = 0; }
         else if (b_stable < BTN_DEBOUNCE_TICKS) { b_stable++; }
         else if (b_pending != b_committed) {
             b_committed = b_pending;
             if (!b_committed) {
-                if (g_mode == MODE_MENU) {
-                    g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS;
+                const app_t *cur = g_cur;
+                vox_where_btn = 3;
+                if (!cur) {
+                    g_menu_sel = (g_menu_sel + 1) % launcher_count();
                     ESP_LOGI(TAG, "menu selection -> %d", (int)g_menu_sel);
-                } else if (g_mode == MODE_BT_REC) {
-                    if (!btmic_recording()) enter_mode(MODE_MENU);   // side button = back
-                } else if (g_mode == MODE_DICT_USB || g_mode == MODE_DICT_BLE) {
-                    enter_mode(MODE_MENU);                           // side button = back
-                } else if (g_mode == MODE_PRESENTER) {
-                    ESP_LOGI(TAG, "btn B down (prev slide)");
-                    if (!ble_presenter_send_key(HID_KEY_LEFT_ARROW)) {
-                        hid_send_tap(0, HID_KEY_LEFT_ARROW);
-                    }
+                } else if (cur->side_down) {
+                    cur->side_down();
+                } else {
+                    enter_app(NULL);                   // default: side button = back
                 }
             }
         }
@@ -1792,41 +1991,24 @@ static void button_task(void *arg)
             if (!a_committed) {
                 // Just pressed.
                 a_press_start = xTaskGetTickCount();
-                vox_config_get(&a_press_cfg);
+                vox_config_get(&g_press_cfg);
                 a_long_latched = false;
                 ESP_LOGI(TAG, "btn A down");
-                if (g_mode == MODE_BT_REC) btmic_start();    // push-to-talk
-                if (g_mode == MODE_DICT_USB && !g_vad_display_enabled) lcd_status(COL_MAGENTA);
+                const app_t *cur = g_cur;
+                vox_where_btn = 1;
+                if (cur && cur->front_down) cur->front_down();
             } else {
                 // Just released — decide what this press means.
-                TickType_t held = xTaskGetTickCount() - a_press_start;
-                bool is_long = pdTICKS_TO_MS(held) >= a_press_cfg.long_press_ms;
-                if (g_mode == MODE_BT_REC) {
-                    btmic_stop();                                      // release = stop talking
-                } else if (pdTICKS_TO_MS(held) >= MODE_TOGGLE_MS) {
-                    if (g_mode != MODE_MENU) enter_mode(MODE_MENU);    // back to the menu
-                } else if (g_mode == MODE_MENU) {
-                    enter_mode(k_menu[g_menu_sel].mode);               // enter the item
-                } else {
-                    uint8_t modifier = is_long ?
-                        a_press_cfg.hold_modifier : a_press_cfg.tap_modifier;
-                    uint8_t keycode = is_long ?
-                        a_press_cfg.hold_keycode : a_press_cfg.tap_keycode;
-                    if (g_mode == MODE_PRESENTER) {
-                        modifier = 0;
-                        keycode = is_long ? HID_KEY_LEFT_ARROW : HID_KEY_RIGHT_ARROW;
-                    }
-                    ESP_LOGI(TAG, "btn A up after %lu ms (%s 0x%02x+0x%02x)",
-                             (unsigned long)pdTICKS_TO_MS(held),
-                             is_long ? "long" : "tap", modifier, keycode);
-                    // BLE modes try the radio first and fall back to USB, so a
-                    // plugged-in cable still works when the link is down.
-                    bool via_ble = (g_mode == MODE_PRESENTER || g_mode == MODE_DICT_BLE) &&
-                                   ble_presenter_send_chord(modifier, keycode);
-                    if (!via_ble) hid_send_tap(modifier, keycode);
-                    if (g_mode == MODE_DICT_USB && !g_vad_display_enabled) {
-                        lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
-                    }
+                uint32_t held_ms = pdTICKS_TO_MS(xTaskGetTickCount() - a_press_start);
+                bool is_long = held_ms >= g_press_cfg.long_press_ms;
+                const app_t *cur = g_cur;
+                vox_where_btn = 2;
+                if (!cur) {
+                    enter_app(launcher_app(g_menu_sel));      // any press length opens the highlighted app
+                } else if ((cur->flags & APP_HOLD_EXITS) && held_ms >= MODE_TOGGLE_MS) {
+                    enter_app(NULL);                   // back to the menu
+                } else if (cur->front_up) {
+                    cur->front_up(held_ms, is_long);
                 }
             }
         }
@@ -1836,9 +2018,10 @@ static void button_task(void *arg)
         // will send Enter rather than toggle voice.
         if (!a_committed && !a_long_latched) {
             TickType_t held = xTaskGetTickCount() - a_press_start;
-            if (pdTICKS_TO_MS(held) >= a_press_cfg.long_press_ms) {
+            if (pdTICKS_TO_MS(held) >= g_press_cfg.long_press_ms) {
                 a_long_latched = true;
-                if (g_mode == MODE_DICT_USB && !g_vad_display_enabled) lcd_status(COL_BLUE);
+                const app_t *cur = g_cur;
+                if (cur && (cur->flags & APP_USB_MIC) && !g_vad_display_enabled) lcd_status(COL_BLUE);
             }
         }
 
@@ -1920,8 +2103,25 @@ void app_main(void)
 #endif
 
     buttons_init();
+    {   // Abnormal reset? Remember why, and where the stick said it was working.
+        esp_reset_reason_t rr = esp_reset_reason();
+        if (rr == ESP_RST_SW && vox_stall_magic == 0xBEEF) {            // the monitor restarted us
+            g_fault_reason = 8;
+            snprintf(g_fault_who, sizeof(g_fault_who), "M%u %.4s", (unsigned)vox_stuck_mask, (const char *)vox_holder);
+            g_fault_crumb = (uint32_t)vox_where_disp * 10000 + (uint32_t)vox_where_btn * 1000 + (vox_crumb % 1000);
+        } else if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+                   rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT) {
+            g_fault_reason = (int)rr;
+            g_fault_crumb = vox_crumb;
+        }
+        vox_stall_magic = 0;
+        vox_crumb = 0;
+    }
     btmic_init(btmic_pcm_read);
+    btmic_set_mode(false, true);                  // the menu is up: housekeeping allowed
+    g_last_activity = xTaskGetTickCount();
     xTaskCreate(button_task, "btn", 4096, NULL, 5, NULL);
+    xTaskCreate(monitor_task, "mon", 3072, NULL, 7, NULL);
     ESP_LOGI(TAG, "buttons up (BtnA=GPIO%d)", BTN_A_GPIO);
 
     // BMI270 IMU for orientation-based mic auto-mute. Best-effort: if init
@@ -1936,7 +2136,7 @@ void app_main(void)
 #if !VOX_DEBUG_NO_UAC
     lcd_draw_mic_status(0, false, g_codec_ready, effective_mic_muted());
     g_pres_lcd_mu = xSemaphoreCreateMutexStatic(&g_pres_lcd_mu_buf);
-    xTaskCreate(vad_lcd_task, "vad_lcd", 3072, NULL, 4, NULL);
+    xTaskCreate(vad_lcd_task, "vad_lcd", 3072, NULL, 6, NULL);   // above btmic/btn so uploads cannot starve the screen
 #endif
 
 #if VOX_AUTO_DOWNLOAD_AFTER_SEC > 0

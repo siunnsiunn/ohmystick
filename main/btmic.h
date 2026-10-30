@@ -3,6 +3,7 @@
 // service (docs/BT-MIC.md). Audio is IMA ADPCM, 20 ms per notification, and is
 // only captured while the front button is held.
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 typedef enum {
@@ -12,6 +13,9 @@ typedef enum {
     BTMIC_UI_BUSY,         // the Mac is transcribing
     BTMIC_UI_DONE,         // text delivered
     BTMIC_UI_ERR,          // the Mac reported an error
+    BTMIC_UI_REC_OFF,      // recording to flash (no Mac in reach)
+    BTMIC_UI_SYNC,         // uploading stored recordings
+    BTMIC_UI_FULL,         // no free slot for an offline recording
 } btmic_ui_t;
 
 // Supplies mono 16 kHz int16 samples (blocking). Returns the number of samples
@@ -27,7 +31,15 @@ int  vox_audio_svc_init(void);
 void btmic_on_subscribe(uint16_t conn_handle, uint16_t attr_handle, uint8_t cur_notify);
 void btmic_on_disconnect(void);
 
-bool       btmic_start(void);       // false if the link is not ready
+// Which screens are up: stored recordings upload only on the BT REC screen, and
+// flash housekeeping runs only on idle screens (menu, BT REC).
+void       btmic_set_mode(bool sync_ok, bool maintain_ok);
+int        btmic_pending(void);     // recordings stored on the stick
+void       btmic_debug(char *buf, size_t n);   // short upload diagnostics for the screen
+extern volatile uint32_t vox_crumb;
+extern volatile uint32_t vox_hb_rec;            // last activity marker; survives a reset
+
+bool       btmic_start(bool offline); // live (needs the Mac listening) or stored on the stick; false if not possible
 void       btmic_stop(void);
 bool       btmic_recording(void);
 btmic_ui_t btmic_ui_state(void);

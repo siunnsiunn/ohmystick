@@ -84,7 +84,10 @@ func makeFrame(type: FrameType, session: UInt16, seq: UInt16,
     return f
 }
 
+let flagOffline: UInt8 = 0x01     // frame byte 7: a recording stored on the stick
+
 struct ParsedFrame {
+    var flags: UInt8 = 0
     var type: FrameType
     var session: UInt16
     var seq: UInt16
@@ -107,7 +110,7 @@ func parseFrame(_ f: [UInt8]) -> ParsedFrame? {
             pcm.append(adpcmDecodeSample(b >> 4, &s))
         }
     }
-    return ParsedFrame(type: type, session: session, seq: seq, pcm: pcm)
+    return ParsedFrame(flags: f[7], type: type, session: session, seq: seq, pcm: pcm)
 }
 
 // MARK: - WAV
@@ -175,6 +178,20 @@ func transcribe(wav: URL, language: String, model: String) throws -> String {
     return (try String(contentsOf: txt, encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// Appends a transcript of a recording made while the Mac was out of reach to
+/// ~/btmic-inbox.md. The time is when it reached the Mac, not when it was spoken.
+func saveToInbox(_ text: String) {
+    let path = NSHomeDirectory() + "/btmic-inbox.md"
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"
+    let entry = "## \(f.string(from: Date())) (offline recording)\n\n\(text)\n\n"
+    if let h = FileHandle(forWritingAtPath: path) {
+        h.seekToEndOfFile(); h.write(Data(entry.utf8)); try? h.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: Data(entry.utf8), attributes: [.posixPermissions: 0o600])
+    }
+    log("saved to \(path)")
+}
+
 /// Copies to the clipboard, and pastes (Cmd+V, optional Return) only when this
 /// process has the Accessibility permission. Never pastes silently otherwise.
 func deliver(_ text: String, pressReturn: Bool) {
@@ -203,7 +220,7 @@ let btmicAudio   = CBUUID(string: "5E3B0001-8A7C-4F1E-9B2D-7C4A1F0E6D10")
 let btmicCtrl    = CBUUID(string: "5E3B0002-8A7C-4F1E-9B2D-7C4A1F0E6D10")
 let hidService   = CBUUID(string: "1812")
 
-enum Ctrl: UInt8 { case busy = 1, done = 2, err = 3 }
+enum Ctrl: UInt8 { case busy = 1, done = 2, err = 3, ping = 5 }
 
 func log(_ s: String) {
     let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
@@ -233,6 +250,8 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var expectSeq: UInt16 = 0
     private var pcm: [Int16] = []
     private var lostFrames = 0
+    private var offline = false
+    private var heartbeat: Timer?
     private var idleTimeout: DispatchWorkItem?
 
     init(pressReturn: Bool) {
@@ -306,6 +325,7 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
         log("disconnected")
         peripheral = nil; ctrlChar = nil; active = false; idleTimeout?.cancel()
+        heartbeat?.invalidate(); heartbeat = nil
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
@@ -326,7 +346,13 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor c: CBCharacteristic, error: Error?) {
         if let e = error { log("subscribe failed: \(e.localizedDescription)") }
-        else { log("ready: hold the front button on BT REC and talk") }
+        else {
+            log("ready: hold the front button on BT REC and talk")
+            // The stick only treats this Mac as present while it hears this every few seconds.
+            send(.ping)
+            heartbeat?.invalidate()
+            heartbeat = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.send(.ping) }
+        }
     }
 
     // ---- receiving ---------------------------------------------------------
@@ -334,9 +360,9 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         guard c.uuid == btmicAudio, let data = c.value, let f = parseFrame([UInt8](data)) else { return }
         switch f.type {
         case .start:
-            begin(session: f.session, firstSeq: 1)
+            begin(session: f.session, firstSeq: 1, offline: f.flags & flagOffline != 0)
         case .audio:
-            if !active || f.session != session { begin(session: f.session, firstSeq: f.seq) }
+            if !active || f.session != session { begin(session: f.session, firstSeq: f.seq, offline: f.flags & flagOffline != 0) }
             if f.seq != expectSeq {
                 let missing = Int(f.seq &- expectSeq)
                 if missing > 0 && missing < 100 {
@@ -352,9 +378,9 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
     }
 
-    private func begin(session s: UInt16, firstSeq: UInt16) {
-        active = true; session = s; expectSeq = firstSeq; pcm = []; lostFrames = 0
-        log("recording (session \(s))")
+    private func begin(session s: UInt16, firstSeq: UInt16, offline off: Bool) {
+        active = true; session = s; expectSeq = firstSeq; pcm = []; lostFrames = 0; offline = off
+        log(off ? "receiving a stored recording (session \(s))" : "recording (session \(s))")
         armIdleTimeout()
     }
 
@@ -375,20 +401,25 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         active = false
         let samples = pcm
         let lost = lostFrames
+        let stored = offline
         pcm = []
         log(String(format: "recorded %.1f s, lost frames: %d", Double(samples.count) / 16000, lost))
-        send(.busy)
-        work.async { self.process(samples) }
+        let sess = session
+        send(.busy, session: sess)
+        work.async { self.process(samples, stored: stored, session: sess) }
     }
 
     // ---- transcribe + deliver ------------------------------------------------
-    private func process(_ samples: [Int16]) {
-        func reply(_ c: Ctrl) { DispatchQueue.main.async { self.send(c) } }
-        guard samples.count >= 4800 else { log("too short, ignored"); reply(.err); return }
+    private func process(_ samples: [Int16], stored: Bool, session sess: UInt16) {
+        func reply(_ c: Ctrl) { DispatchQueue.main.async { self.send(c, session: sess) } }
+        // A stored recording with nothing in it is not a failure: tell the stick it
+        // may drop it, otherwise it would flash ERR and keep re-sending it.
+        let nothing: Ctrl = stored ? .done : .err
+        guard samples.count >= 4800 else { log("too short, ignored"); reply(nothing); return }
         var sum = 0.0
         for s in samples { sum += Double(s) * Double(s) }
         let rms = (sum / Double(samples.count)).squareRoot()
-        guard rms >= 40 else { log("silence (rms \(Int(rms))), ignored"); reply(.err); return }
+        guard rms >= 40 else { log("silence (rms \(Int(rms))), ignored"); reply(nothing); return }
 
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btmic-\(getpid())-\(session)")
         defer { try? FileManager.default.trashItem(at: dir, resultingItemURL: nil) }
@@ -399,20 +430,30 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             let started = Date()
             let text = try transcribe(wav: wav, language: language, model: model)
             log(String(format: "text (%.1f s): %@", Date().timeIntervalSince(started), text))
-            guard !text.isEmpty else { reply(.err); return }
+            guard !text.isEmpty else { reply(nothing); return }
             DispatchQueue.main.async {
-                deliver(text, pressReturn: self.pressReturn)
-                self.send(.done)
+                if stored {
+                    // Recorded earlier: the cursor is somewhere else now, so file it instead of pasting.
+                    saveToInbox(text)
+                } else {
+                    deliver(text, pressReturn: self.pressReturn)
+                }
+                self.send(.done, session: sess)
             }
         } catch {
             log("error: \(error.localizedDescription)")
-            reply(.err)
+            // A stored recording stays on the stick for another try; only live ones are answered.
+            if !stored { reply(.err) }
         }
     }
 
-    private func send(_ c: Ctrl) {
+    /// Status goes with the recording's session number so a stick that is waiting
+    /// for an answer about one recording is never satisfied by another's.
+    private func send(_ c: Ctrl, session: UInt16? = nil) {
         guard let p = peripheral, let ch = ctrlChar else { return }
-        p.writeValue(Data([c.rawValue]), for: ch, type: .withoutResponse)
+        var bytes: [UInt8] = [c.rawValue]
+        if let s = session { bytes += [UInt8(s & 0xFF), UInt8(s >> 8)] }
+        p.writeValue(Data(bytes), for: ch, type: .withoutResponse)
     }
 }
 
