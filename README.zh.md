@@ -1,18 +1,8 @@
-# voxstick
+# ohmystick
 
-> 一根插 Mac 就能用的 **中英语音输入棒**，专门跟**微信输入法**搭配丝滑。
 > [English README](README.md)
 
-把麦克风和按键塞进 USB 棒里。**按一下说话，再按一下停，长按一下发送**。
-所有事都靠系统自带的输入法（推荐微信输入法）和 USB 标准协议完成
-——**不装任何驱动，不装任何 menu bar app**。
-
-```
-[USB-C] → 棒 → Mac
-         │
-         ├ 16 kHz 麦克风 (USB Audio Class)
-         └ 蓝牙级别的真键盘 (USB HID)：默认左 Ctrl+F12 / Enter
-```
+M5Stack StickS3（ESP32-S3）的選單與語音筆記韌體，分叉自 openbrt 的 [voxstick](https://github.com/openbrt/voxstick)（MIT）。
 
 ## 這個分支：選單、WHISPER 與 NOTE
 
@@ -34,6 +24,22 @@ tools/btmic/run.sh       # 啟動接收（記錄：~/.btmic.log）
 ```
 
 第一次執行需要替 `btmic.app` 授權藍牙與輔助使用；每次重新編譯後，輔助使用要移除再加回。
+
+## 原版 voxstick（USB MIC 項目）
+
+> 一根插 Mac 就能用的 **中英语音输入棒**，专门跟**微信输入法**搭配丝滑。
+> [English README](README.md)
+
+把麦克风和按键塞进 USB 棒里。**按一下说话，再按一下停，长按一下发送**。
+所有事都靠系统自带的输入法（推荐微信输入法）和 USB 标准协议完成
+——**不装任何驱动，不装任何 menu bar app**。
+
+```
+[USB-C] → 棒 → Mac
+         │
+         ├ 16 kHz 麦克风 (USB Audio Class)
+         └ 蓝牙级别的真键盘 (USB HID)：默认左 Ctrl+F12 / Enter
+```
 
 ## 真机和屏幕状态
 
@@ -89,6 +95,8 @@ tools/btmic/run.sh       # 啟動接收（記錄：~/.btmic.log）
 
 ## 最快烧录：网页一键安装
 
+> **這裡的網頁安裝器和 release 屬於上游 voxstick**，只會刷入原版韌體，沒有選單、WHISPER 與 NOTE。要用本分支請照下一節從原始碼編譯。
+
 普通用户不用装 ESP-IDF，也不用配 Python。直接用网页烧录器：
 
 1. **电脑：**用桌面版 Chrome 或 Microsoft Edge 打开
@@ -127,6 +135,13 @@ Windows 用户把端口换成类似 `COM5` 即可。
 烧录完成后用“拔 USB → 双击 PWR 关机 → 再插 USB”最稳。
 
 ## 编译 & 烧录
+
+本分支需要 ESP-IDF 5.5.1，並使用自訂分區表（`partitions.csv`，含 NOTE 用的 3 MB `inbox` 分區），第一次刷入必須包含分區表；`idf.py flash` 會處理，也不會動 NVS 裡的配對資料。
+
+```
+idf.py -B build-menu -D SDKCONFIG=build-menu/sdkconfig build
+idf.py -B build-menu -D SDKCONFIG=build-menu/sdkconfig -p /dev/cu.usbmodemXXXX flash
+```
 
 ```sh
 . $IDF_PATH/export.sh

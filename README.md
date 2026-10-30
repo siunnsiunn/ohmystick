@@ -1,16 +1,9 @@
-# voxstick
+# ohmystick
 
 > **[简体中文 README](README.zh.md)** — 中文版本带微信输入法配置详细教程
 
-USB push-to-talk dictation stick for macOS / Windows, built on the
-M5Stack StickS3 (ESP32-S3).
-
-The stick is a single composite USB device that hosts see as **both** a
-16 kHz microphone *and* a HID keyboard. Tap the front button to toggle
-voice input, long-press to send (Enter). Lay the stick flat on a desk with
-the screen facing up and the IMU mutes the mic automatically. Flat auto-mute
-and button shortcut keys are configurable from the browser. No drivers,
-no companion app, plug-and-play on macOS / Windows / Linux.
+A launcher and voice-notes firmware for the M5Stack StickS3 (ESP32-S3), forked
+from [voxstick](https://github.com/openbrt/voxstick) by openbrt (MIT).
 
 ## This fork: launcher, WHISPER and NOTE
 
@@ -39,6 +32,18 @@ tools/btmic/run.sh       # start the receiver (log: ~/.btmic.log)
 
 First run needs Bluetooth and Accessibility permission for `btmic.app`;
 the Accessibility grant must be re-added after every rebuild.
+
+## The original voxstick (the USB MIC app)
+
+USB push-to-talk dictation stick for macOS / Windows, built on the
+M5Stack StickS3 (ESP32-S3).
+
+The stick is a single composite USB device that hosts see as **both** a
+16 kHz microphone *and* a HID keyboard. Tap the front button to toggle
+voice input, long-press to send (Enter). Lay the stick flat on a desk with
+the screen facing up and the IMU mutes the mic automatically. Flat auto-mute
+and button shortcut keys are configurable from the browser. No drivers,
+no companion app, plug-and-play on macOS / Windows / Linux.
 
 ## What it looks like
 
@@ -73,6 +78,10 @@ work — VoiceInk, MacWhisper Pro, or macOS native Dictation.
 + ES8311 codec + MEMS mic + ST7789 LCD + BMI270 IMU + USB-C, ~$25.
 
 ## Install prebuilt firmware
+
+> **These installers and releases belong to upstream voxstick.** They flash
+> the original firmware only: no launcher, WHISPER or NOTE. To get this fork,
+> build it from source (next section).
 
 The easiest path is the browser installer:
 
@@ -122,6 +131,16 @@ operations are long press = download mode, double press = power off, and single
 press = power on.
 
 ## Build
+
+This fork needs ESP-IDF 5.5.1. It uses a custom partition table
+(`partitions.csv`, with a 3 MB `inbox` partition for NOTE), so the first flash
+must include the partition table; `idf.py flash` does that and leaves the
+pairing data in NVS alone.
+
+```
+idf.py -B build-menu -D SDKCONFIG=build-menu/sdkconfig build
+idf.py -B build-menu -D SDKCONFIG=build-menu/sdkconfig -p /dev/cu.usbmodemXXXX flash
+```
 
 ```sh
 . $IDF_PATH/export.sh
