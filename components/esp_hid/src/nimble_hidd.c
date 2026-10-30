@@ -161,6 +161,8 @@ static int ble_hid_create_info_db(void)
     return rc;
 }
 
+extern int vox_audio_svc_init(void) __attribute__((weak));
+
 static int nimble_hid_start_gatts(void)
 {
     int rc = ESP_OK;
@@ -179,6 +181,14 @@ static int nimble_hid_start_gatts(void)
     }
     /* init the hid svc */
     ble_svc_hid_init();
+
+    /* optional vendor service supplied by the application (weak: absent in stock builds) */
+    if (vox_audio_svc_init) {
+        rc = vox_audio_svc_init();
+        if (rc != 0) {
+            return rc;
+        }
+    }
 
     return rc;
 }

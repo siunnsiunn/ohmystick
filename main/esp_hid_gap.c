@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "btmic.h"
 #include "esp_hid_gap.h"
 #include "esp_random.h"
 
@@ -849,6 +850,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         break;
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
+        btmic_on_disconnect();
 
         return 0;
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -863,6 +865,8 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
+        btmic_on_subscribe(event->subscribe.conn_handle, event->subscribe.attr_handle,
+                           event->subscribe.cur_notify);
         ESP_LOGI(TAG, "subscribe event; conn_handle=%d attr_handle=%d "
                 "reason=%d prevn=%d curn=%d previ=%d curi=%d\n",
                 event->subscribe.conn_handle,

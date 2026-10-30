@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>local.btmic</string>
+<key>CFBundleName</key><string>btmic</string><key>CFBundleExecutable</key><string>btmic</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/>
+<key>NSBluetoothAlwaysUsageDescription</key><string>btmic 需要藍牙來接收 StickS3 的錄音。</string>
+</dict></plist>

@@ -35,6 +35,8 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # bond across reboots so the host reconnects without re-pairing. Both verified on
 # macOS 26 (overnight variant v2).
 CONFIG_BT_NIMBLE_SM_LVL=2
+# BT REC streams 50 notifications/s; give the host more mbufs than the default 12.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

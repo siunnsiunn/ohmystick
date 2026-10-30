@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
-         "ble_presenter.c" "esp_hid_gap.c"
+         "ble_presenter.c" "esp_hid_gap.c" "btmic.c"
     PRIV_REQUIRES driver
                   esp_driver_i2c
                   esp_driver_spi

@@ -48,6 +48,7 @@
 #include "bmi2_defs.h"
 #include "vox_config.h"
 #include "ble_presenter.h"
+#include "btmic.h"
 
 // Set to 1 to skip TinyUSB / UAC init - keeps USB-Serial/JTAG console
 // alive on /dev/cu.usbmodem* so we can read ESP_LOG output. Diagnostic
@@ -186,6 +187,7 @@ typedef enum {
     MODE_MENU = 0,
     MODE_DICT_USB,      // dictation, USB microphone + USB HID keys
     MODE_DICT_BLE,      // dictation remote: BLE HID keys trigger the host's own mic
+    MODE_BT_REC,        // hold BtnA: stick mic streams over BLE to the Mac helper (btmic)
     MODE_PRESENTER,     // slide keys (BLE first, USB fallback)
 } vox_mode_t;
 
@@ -196,9 +198,10 @@ typedef struct {
 } menu_item_t;
 
 static const menu_item_t k_menu[] = {
-    { "USB",   "MIC", COL_CYAN,   MODE_DICT_USB  },
-    { "BT",    "MIC", COL_GREEN,  MODE_DICT_BLE  },
-    { "SLIDE", "",    COL_ORANGE, MODE_PRESENTER },
+    { "USB MIC", "", COL_CYAN,    MODE_DICT_USB  },
+    { "BT MIC",  "", COL_GREEN,   MODE_DICT_BLE  },
+    { "BT REC",  "", COL_MAGENTA, MODE_BT_REC    },
+    { "SLIDE",   "", COL_ORANGE,  MODE_PRESENTER },
 };
 #define MENU_ITEMS ((int)(sizeof(k_menu) / sizeof(k_menu[0])))
 
@@ -209,7 +212,7 @@ static void enter_mode(vox_mode_t m)
 {
     g_mode = m;
     ESP_LOGW(TAG, "mode -> %d", (int)m);
-    if (m == MODE_PRESENTER || m == MODE_DICT_BLE) {
+    if (m == MODE_PRESENTER || m == MODE_DICT_BLE || m == MODE_BT_REC) {
         ble_presenter_start_async();   // radio on only after an explicit choice
     }
 }
@@ -492,7 +495,8 @@ static void lcd_draw_menu(int sel)
     if (!g_lcd) return;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    const int row_h = 72, gap = 6, margin = 6, scale = 4;
+    const int gap = 6, margin = 3, scale = 3;
+    const int row_h = (LCD_H - 2 * margin - gap * (MENU_ITEMS - 1)) / MENU_ITEMS;
     for (int i = 0; i < MENU_ITEMS; i++) {
         int y = margin + i * (row_h + gap);
         bool on = (i == sel);
@@ -506,13 +510,9 @@ static void lcd_draw_menu(int sel)
             lcd_fill_rect(LCD_W - margin - 2, y, LCD_W - margin, y + row_h, col);
         }
         uint16_t fg = on ? COL_BLACK : col;
-        const char *l1 = k_menu[i].l1, *l2 = k_menu[i].l2;
-        if (l2[0]) {
-            lcd_draw_text((LCD_W - lcd_text_width(l1, scale)) / 2, y + 6,  l1, scale, fg);
-            lcd_draw_text((LCD_W - lcd_text_width(l2, scale)) / 2, y + 38, l2, scale, fg);
-        } else {
-            lcd_draw_text((LCD_W - lcd_text_width(l1, scale)) / 2, y + 22, l1, scale, fg);
-        }
+        const char *l1 = k_menu[i].l1;
+        lcd_draw_text((LCD_W - lcd_text_width(l1, scale)) / 2,
+                      y + (row_h - 7 * scale) / 2, l1, scale, fg);
     }
     xSemaphoreGive(g_pres_lcd_mu);
 }
@@ -540,6 +540,25 @@ static void lcd_clear_locked(void)
     if (!g_lcd) return;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
+// BT REC screen: one big word for the state (see btmic_ui_t).
+static void lcd_draw_btrec(int ui)
+{
+    static const struct { const char *word; uint16_t col; } k[] = {
+        { "NO LINK", COL_ORANGE }, { "READY", COL_CYAN }, { "REC",  COL_RED },
+        { "BUSY",    COL_YELLOW }, { "DONE",  COL_GREEN }, { "ERR",  COL_RED },
+    };
+    if (!g_lcd) return;
+    if (ui < 0 || ui >= (int)(sizeof(k) / sizeof(k[0]))) ui = 0;
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_clear(COL_BLACK);
+    lcd_draw_text((LCD_W - lcd_text_width("BT REC", 3)) / 2, 24, "BT REC", 3, COL_LIGHT_GRAY);
+    int scale = 8;
+    while (scale > 1 && lcd_text_width(k[ui].word, scale) > LCD_W - 8) scale--;
+    lcd_draw_text((LCD_W - lcd_text_width(k[ui].word, scale)) / 2,
+                  (LCD_H - 7 * scale) / 2, k[ui].word, scale, k[ui].col);
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -608,6 +627,7 @@ static void vad_lcd_task(void *arg)
     int  last_ble_st = 0;
     int  last_mode = -1;
     int  last_sel  = -1;
+    int  last_ui   = -1;
 
     while (1) {
         vox_mode_t mode = g_mode;
@@ -620,6 +640,18 @@ static void vad_lcd_task(void *arg)
                 lcd_draw_menu(sel);
             }
             vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
+            continue;
+        }
+
+        if (mode == MODE_BT_REC) {
+            int ui = (int)btmic_ui_state();
+            if (last_mode != (int)mode || last_ui != ui) {
+                if (last_mode != (int)mode) lcd_clear_locked();
+                last_mode = (int)mode;
+                last_ui = ui;
+                lcd_draw_btrec(ui);
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
@@ -1296,6 +1328,21 @@ static esp_err_t uac_input_cb(uint8_t *buf, size_t len, size_t *bytes_read, void
     return ret;
 }
 
+// Feeds btmic: same mic path and +18 dB make-up gain as the USB microphone.
+static int btmic_pcm_read(int16_t *dst, int n)
+{
+    if (!g_codec_ready) return -1;
+    esp_err_t ret = esp_codec_dev_read(g_codec_dev, dst, n * (int)sizeof(int16_t));
+    if (ret != ESP_OK) return -1;
+    for (int i = 0; i < n; i++) {
+        int32_t v = (int32_t)dst[i] * 8;
+        if (v >  32767) v =  32767;
+        if (v < -32768) v = -32768;
+        dst[i] = (int16_t)v;
+    }
+    return n;
+}
+
 static esp_err_t uac_output_cb(uint8_t *buf, size_t len, void *arg)
 {
     // No speaker in v1 — host shouldn't even see an output stream because
@@ -1534,6 +1581,8 @@ static void button_task(void *arg)
                 if (g_mode == MODE_MENU) {
                     g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS;
                     ESP_LOGI(TAG, "menu selection -> %d", (int)g_menu_sel);
+                } else if (g_mode == MODE_BT_REC) {
+                    if (!btmic_recording()) enter_mode(MODE_MENU);   // side button = back
                 } else if (g_mode == MODE_PRESENTER) {
                     ESP_LOGI(TAG, "btn B down (prev slide)");
                     if (!ble_presenter_send_key(HID_KEY_LEFT_ARROW)) {
@@ -1555,12 +1604,15 @@ static void button_task(void *arg)
                 vox_config_get(&a_press_cfg);
                 a_long_latched = false;
                 ESP_LOGI(TAG, "btn A down");
+                if (g_mode == MODE_BT_REC) btmic_start();    // push-to-talk
                 if (g_mode == MODE_DICT_USB && !g_vad_display_enabled) lcd_status(COL_MAGENTA);
             } else {
                 // Just released — decide what this press means.
                 TickType_t held = xTaskGetTickCount() - a_press_start;
                 bool is_long = pdTICKS_TO_MS(held) >= a_press_cfg.long_press_ms;
-                if (pdTICKS_TO_MS(held) >= MODE_TOGGLE_MS) {
+                if (g_mode == MODE_BT_REC) {
+                    btmic_stop();                                      // release = stop talking
+                } else if (pdTICKS_TO_MS(held) >= MODE_TOGGLE_MS) {
                     if (g_mode != MODE_MENU) enter_mode(MODE_MENU);    // back to the menu
                 } else if (g_mode == MODE_MENU) {
                     enter_mode(k_menu[g_menu_sel].mode);               // enter the item
@@ -1677,6 +1729,7 @@ void app_main(void)
 #endif
 
     buttons_init();
+    btmic_init(btmic_pcm_read);
     xTaskCreate(button_task, "btn", 4096, NULL, 5, NULL);
     ESP_LOGI(TAG, "buttons up (BtnA=GPIO%d)", BTN_A_GPIO);
 

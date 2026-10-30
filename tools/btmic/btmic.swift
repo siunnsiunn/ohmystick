@@ -3,8 +3,9 @@
 // B0 (this file): IMA ADPCM codec, the 172-byte audio frame format, WAV I/O,
 // local Whisper transcription and paste. `selftest` drives all of it from a WAV
 // file so the pipeline can be checked without the device.
-// B1 (BLE receive) is not written yet.
+// B1 (`listen`): CoreBluetooth receiver for the stick's custom service.
 import AppKit
+import CoreBluetooth
 import ApplicationServices
 import Foundation
 
@@ -194,6 +195,250 @@ func deliver(_ text: String, pressReturn: Bool) {
     if pressReturn { usleep(80_000); key(36) }
 }
 
+
+// MARK: - BLE receiver (B1)
+
+let btmicService = CBUUID(string: "5E3B0000-8A7C-4F1E-9B2D-7C4A1F0E6D10")
+let btmicAudio   = CBUUID(string: "5E3B0001-8A7C-4F1E-9B2D-7C4A1F0E6D10")
+let btmicCtrl    = CBUUID(string: "5E3B0002-8A7C-4F1E-9B2D-7C4A1F0E6D10")
+let hidService   = CBUUID(string: "1812")
+
+enum Ctrl: UInt8 { case busy = 1, done = 2, err = 3 }
+
+func log(_ s: String) {
+    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+    let line = "[\(f.string(from: Date()))] \(s)"
+    print(line)
+    fflush(stdout)
+    // Launched as an app there is no terminal, so also keep a log file.
+    let path = NSHomeDirectory() + "/.btmic.log"
+    if let h = FileHandle(forWritingAtPath: path) ?? {
+        FileManager.default.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600])
+        return FileHandle(forWritingAtPath: path)
+    }() {
+        h.seekToEndOfFile(); h.write(Data((line + "\n").utf8)); try? h.close()
+    }
+}
+
+final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private var central: CBCentralManager!
+    private var peripheral: CBPeripheral?
+    private var ctrlChar: CBCharacteristic?
+    private let pressReturn: Bool
+    private let work = DispatchQueue(label: "btmic.work")
+
+    // recording session
+    private var active = false
+    private var session: UInt16 = 0
+    private var expectSeq: UInt16 = 0
+    private var pcm: [Int16] = []
+    private var lostFrames = 0
+    private var idleTimeout: DispatchWorkItem?
+
+    init(pressReturn: Bool) {
+        self.pressReturn = pressReturn
+        super.init()
+        central = CBCentralManager(delegate: self, queue: nil)
+    }
+
+    // ---- finding the stick -------------------------------------------------
+    private func isStick(_ name: String?) -> Bool {
+        guard let n = name else { return false }
+        return n.hasPrefix("StickS3") || n.hasPrefix("SS3")
+    }
+
+    func centralManagerDidUpdateState(_ c: CBCentralManager) {
+        switch c.state {
+        case .poweredOn:
+            log("Bluetooth on, looking for the stick")
+            findDevice()
+            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.findDevice() }
+        case .unauthorized:
+            log("Bluetooth permission denied: System Settings > Privacy & Security > Bluetooth")
+        default:
+            log("Bluetooth state \(c.state.rawValue)")
+        }
+    }
+
+    // The peripheral is pinned by identifier: a device that merely advertises a
+    // "StickS3" name must never be able to feed text into the paste path.
+    private static let pinFile = NSHomeDirectory() + "/.btmic-device"
+
+    private func pinnedID() -> UUID? {
+        (try? String(contentsOfFile: Listener.pinFile, encoding: .utf8))
+            .flatMap { UUID(uuidString: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    private func findDevice() {
+        guard peripheral == nil, central.state == .poweredOn else { return }
+        // Only devices macOS itself holds as paired and connected are candidates (it
+        // hides the HID service from apps, so query our own service); no scan fallback.
+        let pin = pinnedID()
+        for p in central.retrieveConnectedPeripherals(withServices: [btmicService]) {
+            if let pin = pin {
+                if p.identifier == pin { connect(p); return }
+            } else if isStick(p.name) {
+                try? p.identifier.uuidString.write(toFile: Listener.pinFile, atomically: true, encoding: .utf8)
+                chmod(Listener.pinFile, 0o600)
+                log("pinned this stick (\(p.identifier.uuidString)); delete \(Listener.pinFile) to re-pin")
+                connect(p); return
+            }
+        }
+    }
+
+    private func connect(_ p: CBPeripheral) {
+        peripheral = p
+        p.delegate = self
+        log("connecting to \(p.name ?? "?")")
+        central.connect(p, options: nil)
+    }
+
+    func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
+        log("connected, discovering services")
+        p.discoverServices([btmicService])
+    }
+
+    func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
+        log("connect failed: \(error?.localizedDescription ?? "?")")
+        peripheral = nil
+    }
+
+    func centralManager(_ c: CBCentralManager, didDisconnectPeripheral p: CBPeripheral, error: Error?) {
+        log("disconnected")
+        peripheral = nil; ctrlChar = nil; active = false; idleTimeout?.cancel()
+    }
+
+    func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let svc = p.services?.first(where: { $0.uuid == btmicService }) else {
+            log("stick has no BT REC service (old firmware, or macOS cached the old service list: forget the device and pair again)")
+            central.cancelPeripheralConnection(p)
+            return
+        }
+        p.discoverCharacteristics([btmicAudio, btmicCtrl], for: svc)
+    }
+
+    func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error: Error?) {
+        for c in s.characteristics ?? [] {
+            if c.uuid == btmicAudio { p.setNotifyValue(true, for: c) }
+            if c.uuid == btmicCtrl { ctrlChar = c }
+        }
+    }
+
+    func peripheral(_ p: CBPeripheral, didUpdateNotificationStateFor c: CBCharacteristic, error: Error?) {
+        if let e = error { log("subscribe failed: \(e.localizedDescription)") }
+        else { log("ready: hold the front button on BT REC and talk") }
+    }
+
+    // ---- receiving ---------------------------------------------------------
+    func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
+        guard c.uuid == btmicAudio, let data = c.value, let f = parseFrame([UInt8](data)) else { return }
+        switch f.type {
+        case .start:
+            begin(session: f.session, firstSeq: 1)
+        case .audio:
+            if !active || f.session != session { begin(session: f.session, firstSeq: f.seq) }
+            if f.seq != expectSeq {
+                let missing = Int(f.seq &- expectSeq)
+                if missing > 0 && missing < 100 {
+                    pcm += [Int16](repeating: 0, count: missing * samplesPerFrame)
+                    lostFrames += missing
+                }
+            }
+            expectSeq = f.seq &+ 1
+            pcm += f.pcm
+            armIdleTimeout()
+        case .end:
+            if active && f.session == session { finish() }
+        }
+    }
+
+    private func begin(session s: UInt16, firstSeq: UInt16) {
+        active = true; session = s; expectSeq = firstSeq; pcm = []; lostFrames = 0
+        log("recording (session \(s))")
+        armIdleTimeout()
+    }
+
+    /// If the end frame never arrives, finish after a quiet second.
+    private func armIdleTimeout() {
+        idleTimeout?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, self.active else { return }
+            log("no end frame, finishing anyway")
+            self.finish()
+        }
+        idleTimeout = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
+    }
+
+    private func finish() {
+        idleTimeout?.cancel()
+        active = false
+        let samples = pcm
+        let lost = lostFrames
+        pcm = []
+        log(String(format: "recorded %.1f s, lost frames: %d", Double(samples.count) / 16000, lost))
+        send(.busy)
+        work.async { self.process(samples) }
+    }
+
+    // ---- transcribe + deliver ------------------------------------------------
+    private func process(_ samples: [Int16]) {
+        func reply(_ c: Ctrl) { DispatchQueue.main.async { self.send(c) } }
+        guard samples.count >= 4800 else { log("too short, ignored"); reply(.err); return }
+        var sum = 0.0
+        for s in samples { sum += Double(s) * Double(s) }
+        let rms = (sum / Double(samples.count)).squareRoot()
+        guard rms >= 40 else { log("silence (rms \(Int(rms))), ignored"); reply(.err); return }
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("btmic-\(getpid())-\(session)")
+        defer { try? FileManager.default.trashItem(at: dir, resultingItemURL: nil) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let wav = dir.appendingPathComponent("rec.wav")
+            try writeWav16kMono(samples, to: wav)
+            let started = Date()
+            let text = try transcribe(wav: wav, language: language, model: model)
+            log(String(format: "text (%.1f s): %@", Date().timeIntervalSince(started), text))
+            guard !text.isEmpty else { reply(.err); return }
+            DispatchQueue.main.async {
+                deliver(text, pressReturn: self.pressReturn)
+                self.send(.done)
+            }
+        } catch {
+            log("error: \(error.localizedDescription)")
+            reply(.err)
+        }
+    }
+
+    private func send(_ c: Ctrl) {
+        guard let p = peripheral, let ch = ctrlChar else { return }
+        p.writeValue(Data([c.rawValue]), for: ch, type: .withoutResponse)
+    }
+}
+
+// MARK: - Probe (diagnostics)
+
+final class Probe: NSObject, CBCentralManagerDelegate {
+    var c: CBCentralManager!
+    override init() { super.init(); c = CBCentralManager(delegate: self, queue: nil) }
+    func centralManagerDidUpdateState(_ m: CBCentralManager) {
+        guard m.state == .poweredOn else { log("state \(m.state.rawValue)"); return }
+        let sets: [(String, [CBUUID])] = [("HID 1812", [hidService]), ("battery 180F", [CBUUID(string: "180F")]),
+                                          ("btmic service", [btmicService]), ("devinfo 180A", [CBUUID(string: "180A")])]
+        for (n, u) in sets {
+            let r = m.retrieveConnectedPeripherals(withServices: u)
+            log("connected with \(n): \(r.map { ($0.name ?? "?") + " " + $0.identifier.uuidString })")
+        }
+        m.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        log("scanning 12 s for anything named Stick/SS3...")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { log("done"); exit(0) }
+    }
+    func centralManager(_ m: CBCentralManager, didDiscover p: CBPeripheral, advertisementData a: [String: Any], rssi: NSNumber) {
+        let n = (a[CBAdvertisementDataLocalNameKey] as? String) ?? p.name ?? ""
+        if n.hasPrefix("Stick") || n.hasPrefix("SS3") { log("scan saw \(n) \(p.identifier.uuidString) rssi \(rssi)") }
+    }
+}
+
 // MARK: - Entry point
 
 func fail(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n").utf8)); exit(1) }
@@ -247,8 +492,16 @@ case "selftest":
         if args.contains("--paste") { deliver(text, pressReturn: false) }
         print("temp: \(tmp.path)   (move to Trash when done)")
     } catch { fail("error: \(error.localizedDescription)") }
+case "probe":
+    let probe = Probe()
+    withExtendedLifetime(probe) { RunLoop.main.run() }
 case "listen":
-    fail("listen (BLE receive) is B1 and not implemented yet")
+    log("btmic listen started")
+    if !AXIsProcessTrusted() {
+        log("note: no Accessibility permission, text will be copied but not pasted")
+    }
+    let listener = Listener(pressReturn: ProcessInfo.processInfo.environment["BTMIC_ENTER"] == "1")
+    withExtendedLifetime(listener) { RunLoop.main.run() }
 default:
     fail("usage: btmic selftest <wav> [--paste] | listen")
 }
