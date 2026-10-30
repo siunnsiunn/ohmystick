@@ -12,6 +12,34 @@ the screen facing up and the IMU mutes the mic automatically. Flat auto-mute
 and button shortcut keys are configurable from the browser. No drivers,
 no companion app, plug-and-play on macOS / Windows / Linux.
 
+## This fork: launcher, WHISPER and NOTE
+
+This fork (ohmystick) turns the stick into a small launcher. A status bar
+shows battery, charging and Bluetooth. The side button moves through the
+menu, the front button opens an app, and the side button leaves it. Screen
+dims after 15 s and turns off after 30 s.
+
+| App | What it does |
+|---|---|
+| USB MIC | The original voxstick: USB microphone plus HID keyboard |
+| BT DICT | Bluetooth keyboard that triggers the Mac's dictation hotkey |
+| WHISPER | Hold the front button and talk; the stick streams audio over BLE to a small Mac helper, **local** Whisper transcribes it, and the text is pasted at the cursor |
+| NOTE | Same, but works with no Mac in reach: recordings are stored in the stick's flash (12 slots, 30 s each) and upload automatically when you return to NOTE with the helper running; text goes to `~/btmic-inbox.md` |
+| SLIDE | Bluetooth slide clicker |
+
+WHISPER and NOTE need the Mac helper in `tools/btmic/` (Swift plus
+`mlx_whisper`, Apple Silicon). Audio never leaves your machine: no network
+requests, no cloud ASR. Details, protocol and pitfalls are in
+[`docs/BT-MIC.md`](docs/BT-MIC.md) (written in Traditional Chinese).
+
+```
+tools/btmic/build.sh     # build out/btmic.app
+tools/btmic/run.sh       # start the receiver (log: ~/.btmic.log)
+```
+
+First run needs Bluetooth and Accessibility permission for `btmic.app`;
+the Accessibility grant must be re-added after every rebuild.
+
 ## What it looks like
 
 | StickS3 hardware | Upright = live mic | Flat, screen up = muted |

@@ -14,6 +14,27 @@
          └ 蓝牙级别的真键盘 (USB HID)：默认左 Ctrl+F12 / Enter
 ```
 
+## 這個分支：選單、WHISPER 與 NOTE
+
+這個分支（ohmystick）把棒子變成小型選單。頂端狀態列顯示電量、充電與藍牙；側鍵切換項目，前鍵進入，側鍵退出。15 秒變暗、30 秒熄屏。
+
+| 項目 | 功能 |
+|---|---|
+| USB MIC | 原本的 voxstick：USB 麥克風加 HID 鍵盤 |
+| BT DICT | 藍牙鍵盤，觸發 Mac 的聽寫快捷鍵 |
+| WHISPER | 按住前鍵說話，音訊經 BLE 串流到 Mac 小程式，**本機** Whisper 轉文字後貼到游標處 |
+| NOTE | 同上，但身邊沒有 Mac 也能錄：錄音先存進棒子的 flash（12 筆、每筆 30 秒），回到 NOTE 且小程式在線時自動補傳，文字存進 `~/btmic-inbox.md` |
+| SLIDE | 藍牙簡報翻頁 |
+
+WHISPER 與 NOTE 需要 `tools/btmic/` 的 Mac 小程式（Swift 加 `mlx_whisper`，Apple Silicon）。音訊不離開你的電腦：沒有網路請求、沒有雲端辨識。協議與踩坑記錄見 [`docs/BT-MIC.md`](docs/BT-MIC.md)。
+
+```
+tools/btmic/build.sh     # 編譯 out/btmic.app
+tools/btmic/run.sh       # 啟動接收（記錄：~/.btmic.log）
+```
+
+第一次執行需要替 `btmic.app` 授權藍牙與輔助使用；每次重新編譯後，輔助使用要移除再加回。
+
 ## 真机和屏幕状态
 
 | 真机外观 | 竖放 = 收音 | 屏幕朝上平放 = 闭麦 |
