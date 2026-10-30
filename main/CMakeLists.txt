@@ -16,7 +16,7 @@ idf_component_register(
 )
 
 option(VOX_ENABLE_BLE_PRESENTER
-       "Experimental: start BLE HID in presenter mode (off by default)" OFF)
+       "BLE HID for presenter and BT dictation modes (menu); OFF builds a USB-only image" ON)
 option(VOX_DEBUG_NO_UAC "Keep USB-Serial/JTAG alive by skipping UAC/HID init" OFF)
 option(VOX_DIAG_CODEC_FAIL_TONE
        "Diagnostic only: emit a tone over UAC when codec init fails" OFF)

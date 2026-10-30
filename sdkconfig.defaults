@@ -29,7 +29,13 @@ CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 # --- Console: keep USB-Serial/JTAG for logs (separate from UAC USB IF) ---
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
-# --- BLE (presenter mode only; radio stays off until explicit gesture) ---
+# --- BLE (HID keyboard for presenter and BT dictation; radio stays off until a
+#     BLE mode is chosen from the menu) ---
+# SM_LVL=2: HID characteristics require an encrypted link. NVS_PERSIST: keep the
+# bond across reboots so the host reconnects without re-pairing. Both verified on
+# macOS 26 (overnight variant v2).
+CONFIG_BT_NIMBLE_SM_LVL=2
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED=y

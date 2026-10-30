@@ -828,6 +828,13 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
                 event->connect.status == 0 ? "established" : "failed",
                 event->connect.status);
         ble_presenter_set_state(event->connect.status == 0 ? 7 : 97);
+        if (event->connect.status != 0) {
+            // A failed attempt stops advertising and no HIDD disconnect event
+            // follows, so the stick would stay invisible until reboot.
+            if (esp_hid_ble_gap_adv_start() == 0) {
+                ble_presenter_set_state(6);
+            }
+        }
 #if !VOX_BLE_JUST_WORKS
         if (event->connect.status == 0) {
             // Host will not start pairing by itself unless a protected

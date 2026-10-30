@@ -163,22 +163,29 @@ bool ble_presenter_connected(void)
     return s_started && s_connected;
 }
 
-bool ble_presenter_send_key(uint8_t keycode)
+bool ble_presenter_send_chord(uint8_t modifier, uint8_t keycode)
 {
+    if (keycode == 0) return false;
     // Only trust the link once pairing has encrypted it; otherwise the caller
     // falls back to USB.
     if (!ble_presenter_connected() || !s_encrypted || s_hid == NULL) return false;
     uint8_t rpt[8] = {0};
+    rpt[0] = modifier;
     rpt[2] = keycode;
     esp_err_t r1 = esp_hidd_dev_input_set(s_hid, 0, 1, rpt, sizeof(rpt));
     vTaskDelay(pdMS_TO_TICKS(30));
     memset(rpt, 0, sizeof(rpt));
     esp_err_t r2 = esp_hidd_dev_input_set(s_hid, 0, 1, rpt, sizeof(rpt));
     bool ok = (r1 == ESP_OK && r2 == ESP_OK);
-    ESP_LOGI(TAG, "send key 0x%02x: %s/%s", keycode,
+    ESP_LOGI(TAG, "send chord 0x%02x+0x%02x: %s/%s", modifier, keycode,
              esp_err_to_name(r1), esp_err_to_name(r2));
     s_state = ok ? 71 : 72;     // shown on LCD: 71 sent ok, 72 send failed
     return ok;
+}
+
+bool ble_presenter_send_key(uint8_t keycode)
+{
+    return ble_presenter_send_chord(0, keycode);
 }
 
 // Hooks referenced by esp_hid_gap.c (the upstream example used them to start

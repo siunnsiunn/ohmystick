@@ -33,7 +33,9 @@ idf_component_register(SRCS "${srcs}"
 
 target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-format")
 
-# Overnight test matrix: -DVOX_HID_EXTREF_FIX=1 corrects the External Report Reference.
-if(VOX_HID_EXTREF_FIX)
+# External Report Reference must hold the Battery Level *characteristic* UUID.
+# macOS built a HID device only with this fix (overnight variant v2); default ON,
+# pass -DVOX_HID_EXTREF_FIX=0 to get the stock esp_hid value back.
+if(NOT DEFINED VOX_HID_EXTREF_FIX OR VOX_HID_EXTREF_FIX)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE VOX_HID_EXTREF_FIX=1)
 endif()
