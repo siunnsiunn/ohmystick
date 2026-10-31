@@ -1,7 +1,8 @@
 idf_component_register(
     SRCS "main.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
-         "ble_presenter.c" "esp_hid_gap.c" "btmic.c" "inbox.c"
+         "ble_presenter.c" "esp_hid_gap.c" "btmic.c" "inbox.c" "zh_font.c"
     PRIV_REQUIRES driver
+                  esp_system
                   esp_driver_i2c
                   esp_driver_spi
                   esp_codec_dev
@@ -82,3 +83,6 @@ if(tusb_lib AND uac_dir)
         "${COMPONENT_DIR}"
         "${uac_dir}/tusb_uac")
 endif()
+
+# Record the crash address in RTC memory (see __wrap_esp_panic_handler in main.c).
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")

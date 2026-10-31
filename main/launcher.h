@@ -21,6 +21,8 @@
 
 typedef struct app_s {
     const char *name;                       // menu label, ASCII, uppercase letters/digits
+    const char *name_zh;                    // Traditional Chinese label for the menu (UTF-8, see zh_font.c)
+    const char *desc_zh;                    // one-line description shown under the grid when selected
     uint16_t    color;                      // RGB565
     void      (*icon)(int x, int y, uint16_t fg, uint16_t bg);   // 28x28 at (x, y)
     uint32_t    flags;

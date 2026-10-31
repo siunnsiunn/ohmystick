@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "zh_font.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "driver/i2c_master.h"
@@ -41,6 +42,7 @@
 #include "class/hid/hid.h"
 #include "class/hid/hid_device.h"
 #include "esp_system.h"
+#include "esp_private/panic_internal.h"
 #include "hal/wdt_hal.h"
 #include "soc/rtc.h"
 #include "nvs_flash.h"
@@ -52,6 +54,7 @@
 #include "ble_presenter.h"
 #include "btmic.h"
 #include "launcher.h"
+#include "zh_font.h"
 #include "ui.h"
 
 // Set to 1 to skip TinyUSB / UAC init - keeps USB-Serial/JTAG console
@@ -179,6 +182,9 @@ static int          launcher_count(void);
 // which call it is inside (0 = idle). A stall restarts the stick and the next
 // boot shows the markers (see monitor_task).
 #include "esp_attr.h"
+RTC_NOINIT_ATTR volatile uint32_t vox_panic_magic;   // set by the panic hook below
+RTC_NOINIT_ATTR volatile uint32_t vox_panic_pc;
+RTC_NOINIT_ATTR volatile uint32_t vox_panic_exc;
 RTC_NOINIT_ATTR volatile uint8_t  vox_where_disp;
 RTC_NOINIT_ATTR volatile uint8_t  vox_where_btn;
 RTC_NOINIT_ATTR volatile uint32_t vox_stall_magic;
@@ -231,8 +237,12 @@ static bool effective_mic_muted(void)
 static esp_lcd_panel_handle_t g_lcd = NULL;
 // Static line buffer is enough for a single full-width row — colors fit in a
 // uint16_t and we paint by repeating one row 240 times.
-static uint16_t g_lcd_line[2][LCD_W];            // two buffers: the last row of a rect may still be on the wire
+#define LCD_BLK_ROWS 16                          // rows per SPI transfer: 16x fewer transactions than row-by-row
+static uint16_t g_lcd_line[2][LCD_W * LCD_BLK_ROWS];   // two buffers, alternated per call
 static int g_lcd_line_sel = 0;
+static esp_lcd_panel_io_handle_t g_lcd_io = NULL;
+RTC_NOINIT_ATTR volatile uint16_t vox_where_lcd;      // last LCD draw: kind*1000 + y (1 fill, 2 fill by another task, 3 text)
+static void zh_center(int y, const char *s, uint16_t fg, int scale);   // defined with the Chinese text helpers
 static StaticSemaphore_t g_lcd_spi_mu_buf;
 static SemaphoreHandle_t g_lcd_spi_mu = NULL;     // leaf lock around one rectangle: SPI and buffers never shared
 static volatile uint32_t g_lcd_contended = 0;     // times a drawer had to wait for another one
@@ -293,6 +303,7 @@ static esp_err_t lcd_init(void)
     ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO),
                         TAG, "spi_bus_initialize");
 
+    g_lcd_spi_mu = xSemaphoreCreateMutexStatic(&g_lcd_spi_mu_buf);   // before any task can draw
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .dc_gpio_num         = LCD_DC_PIN,
@@ -312,6 +323,7 @@ static esp_err_t lcd_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
                                                  &io_cfg, &io_handle),
                         TAG, "panel_io_spi");
+    g_lcd_io = io_handle;
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = LCD_RST_PIN,
@@ -335,6 +347,36 @@ static esp_err_t lcd_init(void)
     return ESP_OK;
 }
 
+// Linked in with -Wl,--wrap=esp_panic_handler: remember where a crash happened so the
+// DIAG page can show it after the automatic restart (the console is not reachable).
+extern void __real_esp_panic_handler(panic_info_t *info);
+void IRAM_ATTR __wrap_esp_panic_handler(panic_info_t *info)
+{
+    vox_panic_pc = (uint32_t)info->addr;
+    vox_panic_exc = (uint32_t)info->exception;
+    vox_panic_magic = 0xFACE;
+    __real_esp_panic_handler(info);
+}
+
+static void lcd_spi_lock(void)
+{
+    if (!g_lcd_spi_mu) return;                  // not initialised: nothing can be drawn yet
+    if (xSemaphoreTake(g_lcd_spi_mu, 0) != pdTRUE) {
+        TickType_t t0 = xTaskGetTickCount();
+        g_lcd_contended++;
+        xSemaphoreTake(g_lcd_spi_mu, portMAX_DELAY);
+        uint32_t ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0);
+        if (ms > g_lcd_wait_max_ms) g_lcd_wait_max_ms = ms;
+    }
+}
+
+// A command sent with polling waits until every queued colour transfer is done, so the
+// buffers can be reused as soon as the lock is released.
+static void lcd_flush(void)
+{
+    if (g_lcd_io) esp_lcd_panel_io_tx_param(g_lcd_io, 0x00, NULL, 0);   // ST7789 NOP
+}
+
 static void lcd_fill_rect(int x0, int y0, int x1, int y1, uint16_t rgb565)
 {
     if (!g_lcd) return;
@@ -344,23 +386,20 @@ static void lcd_fill_rect(int x0, int y0, int x1, int y1, uint16_t rgb565)
     if (y1 > LCD_H) y1 = LCD_H;
     if (x0 >= x1 || y0 >= y1) return;
 
-    if (!g_lcd_spi_mu) g_lcd_spi_mu = xSemaphoreCreateMutexStatic(&g_lcd_spi_mu_buf);   // first draw is single-threaded (boot)
-    if (xSemaphoreTake(g_lcd_spi_mu, 0) != pdTRUE) {
-        TickType_t t0 = xTaskGetTickCount();
-        g_lcd_contended++;
-        xSemaphoreTake(g_lcd_spi_mu, portMAX_DELAY);
-        uint32_t ms = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - t0);
-        if (ms > g_lcd_wait_max_ms) g_lcd_wait_max_ms = ms;
-    }
+    lcd_spi_lock();
     uint16_t px = lcd_swap_rgb565(rgb565);
     int width = x1 - x0;
     uint16_t *line = g_lcd_line[g_lcd_line_sel ^= 1];
-    for (int x = 0; x < width; x++) line[x] = px;
+    int rows = y1 - y0 < LCD_BLK_ROWS ? y1 - y0 : LCD_BLK_ROWS;
+    for (int i = 0; i < width * rows; i++) line[i] = px;
     bool mine = (g_disp_task != NULL && xTaskGetCurrentTaskHandle() == g_disp_task);
     if (mine) vox_where_disp = 5;                // inside an LCD transfer: a stall here means the SPI draw hung
-    for (int y = y0; y < y1; y++) {
-        esp_lcd_panel_draw_bitmap(g_lcd, x0, y, x1, y + 1, line);
+    for (int y = y0; y < y1; y += LCD_BLK_ROWS) {
+        int n = y1 - y < LCD_BLK_ROWS ? y1 - y : LCD_BLK_ROWS;
+        vox_where_lcd = (uint16_t)((mine ? 1000 : 2000) + y);
+        esp_lcd_panel_draw_bitmap(g_lcd, x0, y, x1, y + n, line);
     }
+    lcd_flush();
     if (mine) vox_where_disp = 4;
     xSemaphoreGive(g_lcd_spi_mu);
 }
@@ -448,6 +487,9 @@ static void lcd_draw_mic_status(uint32_t level, bool active,
         lcd_fill_rect(cx - 30, 166, cx - 30 + meter_w, 170, accent);
     }
 
+    lcd_fill_rect(0, 184, LCD_W, 204, COL_BLACK);
+    zh_center(188, !codec_ready ? "麥克風故障" : (muted ? "已靜音 平放中" : (active ? "收音中" : "待命")),
+              !codec_ready ? COL_RED : (muted ? COL_LIGHT_GRAY : (active ? COL_GREEN : COL_CYAN)), 1);
     if (muted) {
         lcd_draw_thick_line(cx - 28, 150, cx + 28, 62, 4, COL_RED);
     } else if (!codec_ready) {
@@ -491,6 +533,77 @@ static int lcd_text_width(const char *s, int scale)
     return n ? n * 6 * scale - scale : 0;
 }
 
+// ---- Chinese / full text from the 12 px bitmap font (zh_font.c) ---------------
+static const zh_glyph_t *zh_find(uint32_t cp)
+{
+    int lo = 0, hi = k_zh_glyph_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (k_zh_glyphs[mid].cp == cp) return &k_zh_glyphs[mid];
+        if (k_zh_glyphs[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return NULL;
+}
+
+// Next code point of a UTF-8 string (BMP only); advances *s.
+static uint32_t zh_next(const char **s)
+{
+    const uint8_t *p = (const uint8_t *)*s;
+    uint32_t c = p[0];
+    int n = 1;
+    if (c >= 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) { c = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); n = 3; }
+    else if (c >= 0xC0 && (p[1] & 0xC0) == 0x80) { c = ((c & 0x1F) << 6) | (p[1] & 0x3F); n = 2; }
+    *s += n;
+    return c;
+}
+
+static int zh_text_width(const char *s, int scale)
+{
+    int w = 0;
+    while (*s) { const zh_glyph_t *g = zh_find(zh_next(&s)); w += (g ? g->w : 12) * scale; }
+    return w;
+}
+
+#define ZH_MAX_SCALE 3
+static uint16_t g_zh_buf[3][12 * ZH_MAX_SCALE * 12 * ZH_MAX_SCALE];   // ring: the previous glyph may still be on the wire
+static int g_zh_sel = 0;
+
+// Draws text with a background colour (the cell is fully painted, no clearing needed).
+static int zh_text(int x, int y, const char *s, uint16_t fg, uint16_t bg, int scale)
+{
+    uint16_t f = lcd_swap_rgb565(fg), b = lcd_swap_rgb565(bg);
+    if (!g_lcd) return x;
+    if (scale < 1) scale = 1;
+    if (scale > ZH_MAX_SCALE) scale = ZH_MAX_SCALE;
+    while (*s) {
+        const zh_glyph_t *g = zh_find(zh_next(&s));
+        int cw = (g ? g->w : 12) * scale;
+        if (x + cw > LCD_W) break;
+        if (g) {
+            uint16_t *buf = g_zh_buf[g_zh_sel = (g_zh_sel + 1) % 3];
+            for (int r = 0; r < 12 * scale; r++)
+                for (int c = 0; c < cw; c++)
+                    buf[r * cw + c] = (g->rows[r / scale] >> (c / scale)) & 1 ? f : b;
+            lcd_spi_lock();
+            if (g_lcd) {
+                vox_where_lcd = (uint16_t)(3000 + x);
+                esp_lcd_panel_draw_bitmap(g_lcd, x, y, x + cw, y + 12 * scale, buf);
+                lcd_flush();
+            }
+            xSemaphoreGive(g_lcd_spi_mu);
+        }
+        x += cw;
+    }
+    return x;
+}
+
+// Centered Chinese/ASCII text in the 12 px font; returns nothing. Caller holds the UI lock.
+static void zh_center(int y, const char *s, uint16_t fg, int scale)
+{
+    int x = (LCD_W - zh_text_width(s, scale)) / 2;
+    zh_text(x < 0 ? 0 : x, y, s, fg, COL_BLACK, scale);
+}
+
 static void lcd_draw_text(int x, int y, const char *s, int scale, uint16_t col)
 {
     for (; *s; s++, x += 6 * scale) {
@@ -521,7 +634,7 @@ static bool          g_bar_shown_ext = false, g_bar_shown_ble = false;
 static void battery_sample(void);              // defined next to the PMIC code
 static int g_fault_reason = 0;                 // esp_reset_reason() if the last reset was abnormal
 static uint32_t g_fault_crumb = 0;
-static char g_fault_who[12] = "";
+static char g_fault_who[20] = "";
 static volatile int g_batt_mv = 0;
 static volatile int g_batt_dbg = 0;            // 0 = last battery read fine; else error code or 10000+mV
 
@@ -642,58 +755,78 @@ static void lcd_icon_slide(int x, int y, uint16_t c)
     lcd_draw_thick_line(x + 14, y + 23, x + 24, y + 14, 3, c);
 }
 
-#define MENU_ROWS 5
-
-static void lcd_draw_menu(int sel)
+// Launcher: a two-column grid, every app on one page (up to eight), the selected
+// app's description in a strip at the bottom.
+// prev >= 0: only the previously selected cell, the new one and the description strip
+// change, so repaint just those (switching is then instant). prev < 0: whole screen.
+static void lcd_draw_menu(int sel, int prev)
 {
     if (!g_lcd) return;
     int n = launcher_count();
-    int rows = n < MENU_ROWS ? n : MENU_ROWS;
-    int first = sel >= rows ? sel - rows + 1 : 0;      // keep the highlight on screen
+    const int cols = 2, gap = 3, margin = 3;
+    int rows = (n + cols - 1) / cols;
+    const int top = BAR_H + 3;
+    const int strip = 20;                                   // bottom strip for the description
+    int cell_w = (LCD_W - 2 * margin - gap * (cols - 1)) / cols;
+    int cell_h = (LCD_H - top - strip - gap * (rows - 1)) / rows;
+    bool partial = prev >= 0 && prev < n && prev != sel;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
-    lcd_clear(COL_BLACK);
-    const int gap = 4, margin = 3, scale = 2;
-    const int top = BAR_H + margin;
-    const int row_h = (LCD_H - top - margin - gap * (rows - 1)) / rows;
-    for (int r = 0; r < rows; r++) {
-        int i = first + r;
+    if (partial) lcd_fill_rect(0, LCD_H - strip, LCD_W, LCD_H, COL_BLACK);
+    else         lcd_clear(COL_BLACK);
+    for (int i = 0; i < n; i++) {
+        if (partial && i != sel && i != prev) continue;
         const app_t *a = launcher_app(i);
-        int y = top + r * (row_h + gap);
+        int x = margin + (i % cols) * (cell_w + gap);
+        int y = top + (i / cols) * (cell_h + gap);
         bool on = (i == sel);
         uint16_t col = a->color;
+        if (partial) lcd_fill_rect(x, y, x + cell_w, y + cell_h, COL_BLACK);
         if (on) {
-            lcd_fill_rect(margin, y, LCD_W - margin, y + row_h, col);
+            lcd_fill_rect(x, y, x + cell_w, y + cell_h, col);
         } else {
-            lcd_fill_rect(margin, y, LCD_W - margin, y + 2, col);
-            lcd_fill_rect(margin, y + row_h - 2, LCD_W - margin, y + row_h, col);
-            lcd_fill_rect(margin, y, margin + 2, y + row_h, col);
-            lcd_fill_rect(LCD_W - margin - 2, y, LCD_W - margin, y + row_h, col);
+            lcd_fill_rect(x, y, x + cell_w, y + 2, col);
+            lcd_fill_rect(x, y + cell_h - 2, x + cell_w, y + cell_h, col);
+            lcd_fill_rect(x, y, x + 2, y + cell_h, col);
+            lcd_fill_rect(x + cell_w - 2, y, x + cell_w, y + cell_h, col);
         }
         uint16_t fg = on ? COL_BLACK : col;
         uint16_t bg = on ? col : COL_BLACK;
-        if (a->icon) a->icon(margin + 6, y + (row_h - 28) / 2, fg, bg);
-        lcd_draw_text(margin + 6 + 28 + 8, y + (row_h - 7 * scale) / 2, a->name, scale, fg);
+        int icon_y = y + (cell_h - 28 - 16) / 2;
+        if (a->icon) a->icon(x + (cell_w - 28) / 2, icon_y, fg, bg);
+        const char *nm = a->name_zh ? a->name_zh : a->name;
+        int nx = x + (cell_w - zh_text_width(nm, 1)) / 2;
+        zh_text(nx < x ? x : nx, icon_y + 28 + 4, nm, fg, bg, 1);
     }
-    if (n > rows) {                                    // scroll hints
-        if (first > 0) lcd_fill_rect(LCD_W - 9, top, LCD_W - 3, top + 3, COL_LIGHT_GRAY);
-        if (first + rows < n) lcd_fill_rect(LCD_W - 9, LCD_H - 6, LCD_W - 3, LCD_H - 3, COL_LIGHT_GRAY);
-    }
+    const app_t *s = launcher_app(sel);
+    if (s && s->desc_zh) zh_center(LCD_H - 16, s->desc_zh, s->color, 1);
     statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
+}
+
+// Words for the BLE bring-up state, shared by the BT DICT and SLIDE screens.
+static void ble_status_words(const char **word, uint16_t *col, int *scale, char *code, size_t n)
+{
+    int st = ble_presenter_state();
+    code[0] = 0;
+    if (ble_presenter_connected())       { *word = "已連線"; *col = COL_CYAN; *scale = 3; }   // a stale error code must not hide a working link
+    else if (st == 98)                 { *word = "配對失敗"; *col = COL_RED; *scale = 2; snprintf(code, n, "到狀態頁長按配對"); }
+    else if (st >= 90)                 { *word = "藍牙錯誤"; *col = COL_RED; *scale = 2; snprintf(code, n, "代碼 %d", st); }
+    else if (st == 8)                  { *word = "輸入配對碼"; *col = COL_YELLOW; *scale = 1; }
+    else                               { *word = "等待連線"; *col = COL_ORANGE; *scale = 2; }
 }
 
 static void lcd_draw_ble_dictation(void)
 {
     if (!g_lcd) return;
+    const char *word; uint16_t col; int scale; char code[16];
+    ble_status_words(&word, &col, &scale, code, sizeof(code));
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    uint16_t col = ble_presenter_connected() ? COL_CYAN : COL_ORANGE;
-    lcd_draw_text((LCD_W - lcd_text_width("BT", 8)) / 2, 70,  "BT",  8, col);
-    lcd_draw_text((LCD_W - lcd_text_width("MIC", 5)) / 2, 140, "MIC", 5, col);
-    int st = ble_presenter_state();
-    uint16_t sc = st >= 90 ? COL_RED : (st == 6 ? COL_GREEN : COL_YELLOW);
-    if (st >= 10) lcd_draw_digit(10, 26, st / 10, sc);
-    lcd_draw_digit(st >= 10 ? 34 : 10, 26, st % 10, sc);
+    zh_center(36, "藍牙聽寫", COL_LIGHT_GRAY, 2);
+    zh_center((LCD_H - 12 * scale) / 2, word, col, scale);
+    if (code[0]) zh_center(140, code, COL_RED, 1);
+    zh_center(190, "前鍵 觸發聽寫快捷鍵", COL_LIGHT_GRAY, 1);
+    zh_center(206, "按住前鍵 回選單", COL_LIGHT_GRAY, 1);
     statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
@@ -722,33 +855,38 @@ void ui_text(int x, int y, const char *s, int scale, uint16_t c) { lcd_draw_text
 // recordings are waiting on the stick.
 static void lcd_draw_btrec(int ui, bool note)
 {
-    static const struct { const char *word; uint16_t col; } k[] = {
-        { "NO LINK", COL_ORANGE }, { "READY", COL_CYAN },  { "REC",  COL_RED },
-        { "BUSY",    COL_YELLOW }, { "DONE",  COL_GREEN }, { "ERR",  COL_RED },
-        { "REC",     COL_RED },    { "SYNC",  COL_CYAN },  { "FULL", COL_RED },
+    // state -> word, colour, and a one-line hint (live dictation / stored notes)
+    static const struct { const char *word; uint16_t col; const char *live; const char *stored; } k[] = {
+        { "未連線", COL_ORANGE, "請開啟 Mac 的 btmic", "按住前鍵錄音" },
+        { "可錄音", COL_CYAN,   "按住前鍵說話",         "按住前鍵錄音" },
+        { "錄音中", COL_RED,    "放開後轉成文字",       "放開即存檔" },
+        { "轉寫中", COL_YELLOW, "請稍候",               "電腦轉寫中" },
+        { "完成",   COL_GREEN,  "",                     "已存入收件夾" },
+        { "失敗",   COL_RED,    "沒聽到內容 請再說一次", "請稍後再試" },
+        { "錄音中", COL_RED,    "",                     "放開即存檔" },
+        { "傳送中", COL_CYAN,   "",                     "正在傳到電腦" },
+        { "已滿",   COL_RED,    "",                     "請連線傳送筆記" },
     };
     if (!g_lcd) return;
     if (ui < 0 || ui >= (int)(sizeof(k) / sizeof(k[0]))) ui = 0;
     int pending = btmic_pending();
-    const char *title = note ? "NOTE" : "WHISPER";
     const char *word = k[ui].word;
     uint16_t wcol = k[ui].col;
     if (note && (ui == BTMIC_UI_NOLINK || ui == BTMIC_UI_READY)) {   // notes record with or without the Mac
-        word = "READY";
+        word = "可錄音";
         wcol = ui == BTMIC_UI_READY ? COL_CYAN : COL_ORANGE;
     }
+    const char *hint = note ? k[ui].stored : k[ui].live;
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_clear(COL_BLACK);
-    lcd_draw_text((LCD_W - lcd_text_width(title, 3)) / 2, 34, title, 3, COL_LIGHT_GRAY);
-    int scale = 8;
-    while (scale > 1 && lcd_text_width(word, scale) > LCD_W - 8) scale--;
-    lcd_draw_text((LCD_W - lcd_text_width(word, scale)) / 2,
-                  (LCD_H - 7 * scale) / 2, word, scale, wcol);
+    zh_center(34, note ? "語音筆記" : "即時聽寫", COL_LIGHT_GRAY, 2);
+    zh_center((LCD_H - 36) / 2, word, wcol, 3);
     if (note && pending > 0 && ui != BTMIC_UI_REC_OFF && ui != BTMIC_UI_REC) {
         char s[24];
-        snprintf(s, sizeof(s), "%d PENDING", pending % 100);
-        lcd_draw_text((LCD_W - lcd_text_width(s, 2)) / 2, 186, s, 2, COL_YELLOW);
+        snprintf(s, sizeof(s), "待傳 %d 筆", pending % 100);
+        zh_center(160, s, COL_YELLOW, 2);
     }
+    zh_center(210, hint, COL_LIGHT_GRAY, 1);
     statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
@@ -756,22 +894,21 @@ static void lcd_draw_btrec(int ui, bool note)
 static void lcd_draw_presenter(void)
 {
     if (!g_lcd) return;
+    const char *word; uint16_t col; int scale; char code[16];
+    ble_status_words(&word, &col, &scale, code, sizeof(code));
+    if (scale > 2) scale = 2;                       // the arrow takes the middle of the screen
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_clear(COL_BLACK);
+    zh_center(34, "簡報翻頁", COL_LIGHT_GRAY, 2);
     const int cx = LCD_W / 2;
-    // Orange = USB keys; cyan = BLE link up.
-    uint16_t col = ble_presenter_connected() ? COL_CYAN : COL_ORANGE;
-    lcd_fill_rect(0, 34, LCD_W, 184, COL_BLACK);
-    lcd_draw_thick_line(cx - 36, 109, cx + 30, 109, 8, col);
-    lcd_draw_thick_line(cx + 34, 109, cx + 6, 80, 8, col);
-    lcd_draw_thick_line(cx + 34, 109, cx + 6, 138, 8, col);
-    // BLE bring-up state (digits): 6 = advertising, 9x = init failure at step x.
-    int st = ble_presenter_state();
-    uint16_t sc = st >= 90 ? COL_RED : (st == 6 ? COL_GREEN : COL_YELLOW);
-#ifdef VOX_BLE_VARIANT
-    lcd_draw_digit(LCD_W - 26, 44, VOX_BLE_VARIANT, COL_WHITE);   // which test variant
-#endif
-    if (st >= 10) lcd_draw_digit(10, 44, st / 10, sc);
-    lcd_draw_digit(st >= 10 ? 34 : 10, 44, st % 10, sc);
+    lcd_draw_thick_line(cx - 36, 99, cx + 30, 99, 8, col);       // the arrow
+    lcd_draw_thick_line(cx + 34, 99, cx + 6, 70, 8, col);
+    lcd_draw_thick_line(cx + 34, 99, cx + 6, 128, 8, col);
+    zh_center(146, word, col, scale);
+    if (code[0]) zh_center(176, code, COL_RED, 1);
+    zh_center(192, "前鍵 下一頁", COL_LIGHT_GRAY, 1);
+    zh_center(208, "側鍵 上一頁", COL_LIGHT_GRAY, 1);
+    statusbar_paint_if_dirty();
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
@@ -797,6 +934,8 @@ void ble_presenter_show_passkey(uint32_t passkey)
     g_passkey_hold_until = xTaskGetTickCount() + pdMS_TO_TICKS(60000);
     xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
     lcd_fill_rect(0, 34, LCD_W, 184, COL_BLACK);
+    zh_center(50, "藍牙配對", COL_LIGHT_GRAY, 2);
+    zh_center(140, "請在電腦輸入配對碼", COL_LIGHT_GRAY, 1);
     for (int i = 5; i >= 0; i--) {
         lcd_draw_digit(4 + i * 21, 95, passkey % 10, COL_YELLOW);
         passkey /= 10;
@@ -867,9 +1006,10 @@ static void vad_lcd_task(void *arg)
 
         if (!a) {
             if (last != a || last_sel != sel) {
+                int prev = (last == a) ? last_sel : -1;      // same screen: repaint only what changed
                 last = a;
                 last_sel = sel;
-                lcd_draw_menu(sel);
+                lcd_draw_menu(sel, prev);
             }
             vox_where_disp = 0;
             vTaskDelay(pdMS_TO_TICKS(VAD_FRAME_MS));
@@ -1031,8 +1171,8 @@ static void battery_sample(void)
     // While the radio is busy the chip sometimes answers with nonsense (about 12 mV
     // was seen), so a reading outside the plausible range is retried like an error.
     esp_err_t e = ESP_FAIL;
-    for (int i = 0; i < 4; i++) {
-        if (i) vTaskDelay(pdMS_TO_TICKS(30));
+    for (int i = 0; i < 6; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(60));
         e = pmic_read_n(0x22, v, 2);
         int m = v[0] | ((v[1] & 0x0F) << 8);
         if (e == ESP_OK && m >= 2500 && m <= 4600) break;
@@ -1047,7 +1187,6 @@ static void battery_sample(void)
     }
     s_fails = 0;
     int mv = v[0] | ((v[1] & 0x0F) << 8);
-    g_batt_mv = mv;
     if (pmic_read_n(0x04, &src, 1) != ESP_OK) src = 0xFF;
     // Measured on a StickS3: VIN reads ~1100 mV with a cable in and 0 on battery
     // (not the real 5 V, so the ADC is scaled), 5VINOUT ~960 vs ~20, and PWR_SRC
@@ -1063,6 +1202,7 @@ static void battery_sample(void)
         g_batt_dbg = 10000 + (mv % 10000);
     } else {
         g_batt_dbg = 0;
+        g_batt_mv = mv;
         int pct = (mv - BATT_EMPTY_MV) * 100 / (BATT_FULL_MV - BATT_EMPTY_MV);
         g_batt_pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
     }
@@ -1198,6 +1338,7 @@ static void pmic_dump_regs(const char *label)
 static esp_err_t pmic_init(void)
 {
     ESP_RETURN_ON_ERROR(pmic_probe(), TAG, "pmic probe");
+    battery_sample();      // first reading now, before the radio is up: while it advertises the chip often answers nonsense
     pmic_dump_regs("before init");
 
     ESP_RETURN_ON_ERROR(pmic_enable_lcd_codec_rail(), TAG, "L3B / I2C_CFG");
@@ -1959,7 +2100,7 @@ static void diag_line(int i, const char *s, uint16_t col)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
-static uint32_t diag_tick(bool first)
+static uint32_t diag_tick_details(bool first)
 {
     static const char *ui_name[] = { "NO LINK", "READY", "REC", "BUSY", "DONE", "ERR", "REC OFF", "SYNC", "FULL" };
     static bool was_held = false;
@@ -1999,59 +2140,140 @@ static uint32_t diag_tick(bool first)
         diag_line(8, s, COL_RED);
         snprintf(s, sizeof(s), "C%05u %s", (unsigned)(g_fault_crumb % 100000), g_fault_who);
         diag_line(9, s, COL_RED);
-        diag_line(13, "FRONT CLEARS  HOLD=PAIR", COL_LIGHT_GRAY);
+        diag_line(13, "FRONT BACK  HOLD PAIR", COL_LIGHT_GRAY);
     } else {
         diag_line(8, "LAST RESET NONE", COL_GREEN);
-        diag_line(13, "HOLD FRONT 2S = PAIR", COL_LIGHT_GRAY);
+        diag_line(13, "FRONT BACK  HOLD PAIR", COL_LIGHT_GRAY);
     }
     return 1000;
 }
 
-static void diag_front_down(void)                 // front button: mark the reset as seen
+// ---- plain-language summary (the default DIAG page) ---------------------------
+// Five rows, each a small label over a big value, and one hint that says what to do.
+static bool g_diag_details = false;
+static char g_diag_sum[10][64];
+
+// One row: a grey label and a coloured value, repainted only when the text changes.
+static void diag_sum_row(int i, int y, const char *label, const char *value, uint16_t col, int scale)
 {
-    g_fault_reason = 0;
-    g_batt_dbg = 0;
-    g_bar_dirty = true;
+    char key[64];
+    snprintf(key, sizeof(key), "%s|%s|%u", label, value, (unsigned)col);
+    if (strcmp(g_diag_sum[i], key) == 0) return;
+    snprintf(g_diag_sum[i], sizeof(g_diag_sum[i]), "%s", key);
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_fill_rect(0, y, LCD_W, y + 12 * scale + 2, COL_BLACK);
+    int x = 4;
+    if (label[0]) x = zh_text(x, y, label, COL_LIGHT_GRAY, COL_BLACK, scale) + 6;
+    zh_text(x, y, value, col, COL_BLACK, scale);
+    xSemaphoreGive(g_pres_lcd_mu);
 }
 
-static void diag_front_up(uint32_t held_ms, bool is_long)   // held 2 s: let a new computer pair for 60 s
+static uint32_t diag_tick_summary(bool first)
+{
+    if (first) memset(g_diag_sum, 0, sizeof(g_diag_sum));
+    char v[40];
+    bool linked = btmic_ui_state() != BTMIC_UI_NOLINK;
+    int pending = btmic_pending();
+    int left = 0, pair = vox_pair_status(&left);
+    bool batt_known = g_batt_pct >= 0;
+    bool batt_low = batt_known && g_batt_pct <= BATT_LOW_PCT;
+
+    const char *verdict; uint16_t vcol;
+    if (g_fault_reason || batt_low) { verdict = "有問題"; vcol = COL_RED; }
+    else if (!linked || pending > 0 || pair == 2 || !batt_known) { verdict = "請留意"; vcol = COL_YELLOW; }
+    else { verdict = "狀態良好"; vcol = COL_GREEN; }
+    diag_sum_row(0, BAR_H + 6, "", verdict, vcol, 2);
+
+    int y = BAR_H + 44;
+    diag_sum_row(1, y, "電腦連線", linked ? "已連上" : "沒連上", linked ? COL_GREEN : COL_YELLOW, 1);
+    y += 24;
+    if (pending > 0) snprintf(v, sizeof(v), "%d 筆", pending % 100); else snprintf(v, sizeof(v), "無");
+    diag_sum_row(2, y, "待傳筆記", v, pending > 0 ? COL_YELLOW : COL_GREEN, 1);
+    y += 24;
+    if (batt_known) snprintf(v, sizeof(v), "%d%% %s", g_batt_pct, g_batt_ext ? "充電中" : "電池");
+    else snprintf(v, sizeof(v), "量測中");
+    diag_sum_row(3, y, "電量", v, !batt_known ? COL_YELLOW : (batt_low ? COL_RED : COL_GREEN), 1);
+    y += 24;
+    if (pair == 1) snprintf(v, sizeof(v), "開放 %d 秒", left);
+    else if (pair == 2) snprintf(v, sizeof(v), "尚未配對");
+    else snprintf(v, sizeof(v), "已鎖定");
+    diag_sum_row(4, y, "新裝置", v, pair == 0 ? COL_GREEN : COL_YELLOW, 1);
+    y += 24;
+    diag_sum_row(5, y, "本機", g_fault_reason ? "曾自動重開" : "穩定", g_fault_reason ? COL_RED : COL_GREEN, 1);
+
+    const char *h1, *h2 = "";
+    char code[40];
+    if (g_fault_reason) {                       // the reason code, so one photo of this page is enough
+        if (g_fault_reason == 50) snprintf(code, sizeof(code), "R50 C%05u %s", (unsigned)(g_fault_crumb % 100000), g_fault_who);
+        else                      snprintf(code, sizeof(code), "R%d %s", g_fault_reason % 100, g_fault_who);
+        h1 = "重開機過 前鍵確認"; h2 = code;
+    }
+    else if (pair == 2)      { h1 = "請到 Mac 藍牙設定"; h2 = "完成配對"; }
+    else if (!linked)        { h1 = "請開啟 Mac 的 btmic"; h2 = "或喚醒 Mac"; }
+    else if (pending > 0)    { h1 = "請進入 NOTE 畫面"; h2 = "傳送已存的筆記"; }
+    else if (batt_low)       { h1 = "電量偏低 請充電"; }
+    else                     { h1 = "目前不用處理"; }
+    diag_sum_row(6, y + 32, "", h1, COL_WHITE, 1);
+    diag_sum_row(7, y + 48, "", h2, COL_WHITE, 1);
+    diag_sum_row(8, LCD_H - 16, "", "前鍵 詳細  長按 配對", COL_LIGHT_GRAY, 1);
+    return 1000;
+}
+
+static uint32_t diag_tick(bool first)
+{
+    static bool was_details = false, was_held = false;
+    if (g_passkey_hold_until != 0) { was_held = true; return 200; }  // the pairing code owns the screen
+    if (was_held) { was_held = false; lcd_clear_locked(); first = true; }
+    if (first) was_details = g_diag_details = false;
+    if (g_diag_details != was_details) {                              // page switched: start from a clean screen
+        was_details = g_diag_details;
+        lcd_clear_locked();
+        first = true;
+    }
+    return g_diag_details ? diag_tick_details(first) : diag_tick_summary(first);
+}
+
+static void diag_front_up(uint32_t held_ms, bool is_long)   // short: summary <-> details; held 2 s: let a new computer pair for 60 s
 {
     (void)is_long;
-    if (held_ms >= 2000) vox_pair_open();
+    if (held_ms >= 2000) { vox_pair_open(); return; }
+    // The reset notice stays until it has been looked at on the details page and that page is left.
+    if (g_diag_details) { g_fault_reason = 0; g_batt_dbg = 0; g_bar_dirty = true; }
+    g_diag_details = !g_diag_details;
 }
 
 static const app_t app_usb_mic = {
-    .name = "USB MIC", .color = COL_CYAN, .icon = icon_mic,
+    .name = "USB MIC", .name_zh = "USB麥克風", .desc_zh = "當電腦的麥克風", .color = COL_CYAN, .icon = icon_mic,
     .flags = APP_NO_SLEEP | APP_USB_MIC | APP_HOLD_EXITS,
     .tick = usb_mic_tick, .front_down = usb_mic_front_down, .front_up = usb_mic_front_up,
 };
 static const app_t app_bt_dict = {
-    .name = "BT DICT", .color = COL_GREEN, .icon = icon_bluetooth,
+    .name = "BT DICT", .name_zh = "藍牙聽寫", .desc_zh = "藍牙鍵盤輸入", .color = COL_GREEN, .icon = icon_bluetooth,
     .flags = APP_NO_SLEEP | APP_BLE | APP_HOLD_EXITS,
     .tick = bt_dict_tick, .front_up = bt_dict_front_up,
 };
 static const app_t app_whisper = {
-    .name = "WHISPER", .color = COL_MAGENTA, .icon = icon_whisper,
+    .name = "WHISPER", .name_zh = "即時聽寫", .desc_zh = "邊說邊貼上", .color = COL_MAGENTA, .icon = icon_whisper,
     .flags = APP_BLE,
     .tick = whisper_tick, .activity_key = voice_activity,
     .front_down = whisper_front_down, .front_up = voice_front_up, .side_down = voice_side_down,
 };
 static const app_t app_note = {
-    .name = "NOTE", .color = COL_YELLOW, .icon = icon_note,
+    .name = "NOTE", .name_zh = "語音筆記", .desc_zh = "沒電腦也能錄", .color = COL_YELLOW, .icon = icon_note,
     .flags = APP_BLE | APP_SYNC | APP_MAINT,
     .tick = note_tick, .activity_key = voice_activity,
     .front_down = note_front_down, .front_up = voice_front_up, .side_down = voice_side_down,
 };
 static const app_t app_slide = {
-    .name = "SLIDE", .color = COL_ORANGE, .icon = icon_slide,
+    .name = "SLIDE", .name_zh = "簡報翻頁", .desc_zh = "藍牙翻頁筆", .color = COL_ORANGE, .icon = icon_slide,
     .flags = APP_NO_SLEEP | APP_BLE | APP_HOLD_EXITS,
     .tick = slide_tick, .front_up = slide_front_up, .side_down = slide_side_down,
 };
 
 static const app_t app_diag = {
-    .name = "DIAG", .color = COL_RED, .icon = icon_diag,
+    .name = "DIAG", .name_zh = "狀態", .desc_zh = "診斷與配對", .color = COL_RED, .icon = icon_diag,
     .flags = APP_BLE,                                      // BLE up so LINK and UPLOAD mean something
-    .tick = diag_tick, .front_down = diag_front_down, .front_up = diag_front_up,
+    .tick = diag_tick, .front_up = diag_front_up,
 };
 
 static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide, &app_diag };
@@ -2270,7 +2492,7 @@ void app_main(void)
         esp_reset_reason_t rr = esp_reset_reason();
         if (rr == ESP_RST_SW && vox_stall_magic == 0xBEEF) {            // the monitor restarted us
             g_fault_reason = 50;                                          // our own code; 8 is ESP_RST_DEEPSLEEP
-            snprintf(g_fault_who, sizeof(g_fault_who), "M%u H%c", (unsigned)vox_stuck_mask, vox_holder[0] ? vox_holder[0] : 'N');
+            snprintf(g_fault_who, sizeof(g_fault_who), "M%u H%c L%u", (unsigned)vox_stuck_mask, vox_holder[0] ? vox_holder[0] : 'N', (unsigned)vox_where_lcd);
             g_fault_crumb = (uint32_t)vox_where_disp * 10000 + (uint32_t)vox_where_btn * 1000 + (vox_crumb % 1000);
         } else if (rr == ESP_RST_WDT) {                                  // the hardware watchdog: whole chip was stuck
             g_fault_reason = (int)rr;
@@ -2280,7 +2502,9 @@ void app_main(void)
                    rr == ESP_RST_BROWNOUT) {
             g_fault_reason = (int)rr;
             g_fault_crumb = vox_crumb;
+            if (vox_panic_magic == 0xFACE) snprintf(g_fault_who, sizeof(g_fault_who), "%08x E%u", (unsigned)vox_panic_pc, (unsigned)vox_panic_exc);
         }
+        vox_panic_magic = 0;
         vox_stall_magic = 0;
         vox_crumb = 0;
     }

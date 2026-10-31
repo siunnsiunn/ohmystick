@@ -465,6 +465,13 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     // ---- finding the stick -------------------------------------------------
+    private var scanTimer: Timer?
+
+    /// Forgets the current stick, so findDevice() can look again.
+    private func resetLink() {
+        peripheral = nil; ctrlChar = nil; active = false; idleTimeout?.cancel(); heartbeat?.invalidate(); heartbeat = nil
+    }
+
     private func isStick(_ name: String?) -> Bool {
         guard let n = name else { return false }
         return n.hasPrefix("StickS3") || n.hasPrefix("SS3")
@@ -474,12 +481,16 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         switch c.state {
         case .poweredOn:
             log("Bluetooth on, looking for the stick")
+            resetLink()                      // anything held from before Bluetooth went off is stale
             findDevice()
-            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.findDevice() }
+            if scanTimer == nil {
+                scanTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.findDevice() }
+            }
         case .unauthorized:
             log("Bluetooth permission denied: System Settings > Privacy & Security > Bluetooth")
         default:
             log("Bluetooth state \(c.state.rawValue)")
+            resetLink()                      // no disconnect callback comes when the radio is switched off
         }
     }
 

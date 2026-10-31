@@ -838,6 +838,14 @@ static volatile int      s_pair_last_err = 0;
 
 void vox_pair_open(void) { s_pair_open_req = true; }
 
+int vox_pair_status(int *left_s)
+{
+    int64_t left = s_pair_until_us ? (s_pair_until_us - esp_timer_get_time()) / 1000000 : 0;
+    if (left_s) *left_s = left > 0 ? (int)left : 0;
+    if (s_pair_until_us && left > 0) return 1;      /* window open */
+    return s_bonds == 0 ? 2 : 0;                    /* 2 = nothing paired yet, 0 = locked */
+}
+
 void vox_pair_info(char *buf, size_t n, char *sec, size_t sn)
 {
     int64_t left = s_pair_until_us ? (s_pair_until_us - esp_timer_get_time()) / 1000000 : 0;
