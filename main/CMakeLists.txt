@@ -37,7 +37,7 @@ if(VOX_DEBUG_NO_UAC AND
 endif()
 
 set(VOX_BLE_VARIANT "" CACHE STRING "Overnight test variant number (empty = normal build)")
-set(VOX_BLE_JUST_WORKS "1" CACHE STRING "1 = Just Works, 0 = passkey on LCD")
+set(VOX_BLE_JUST_WORKS "0" CACHE STRING "1 = Just Works, 0 = passkey on LCD")
 if(NOT VOX_BLE_VARIANT STREQUAL "")
     math(EXPR VOX_BLE_PID_DEC "18944 + ${VOX_BLE_VARIANT}")   # 0x4A00 + n
     target_compile_definitions(${COMPONENT_LIB} PRIVATE

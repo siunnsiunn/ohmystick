@@ -1,0 +1,3 @@
+#!/bin/bash
+# Agent-neutral access to the NOTE inbox queue (~/btmic-inbox.jsonl). See docs/INBOX.md.
+exec "$(cd "$(dirname "$0")" && pwd)/out/btmic.app/Contents/MacOS/btmic" inbox "$@"

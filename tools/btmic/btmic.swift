@@ -231,6 +231,7 @@ func saveToInbox(_ text: String) -> Bool {
         log("cannot write \(path): \(error.localizedDescription)")
         return false
     }
+    InboxStore.add(text)                       // same text for agents; the .md stays for reading
     log("saved to \(path)")
     return true
 }
@@ -255,6 +256,142 @@ func deliver(_ text: String, pressReturn: Bool) {
     if pressReturn { usleep(80_000); key(36) }
 }
 
+
+// MARK: - Inbox queue (agent-neutral)
+//
+// ~/btmic-inbox.jsonl is a work queue: one JSON object per line. Any agent or script
+// takes items with `btmic inbox claim`, finishes them with `done` (see docs/INBOX.md).
+// A claim carries a lease; if the agent never reports back the item becomes
+// available again. Every change happens under a file lock and is written atomically.
+
+struct InboxItem: Codable {
+    var v: Int = 1
+    var id: String
+    var recorded_at: String          // when the text reached the Mac (ISO 8601)
+    var text: String
+    var status: String = "new"       // new | processing | done
+    var kind: String? = nil
+    var lease_until: String? = nil
+    var handled_by: String? = nil
+    var result: String? = nil
+    var finished_at: String? = nil
+}
+
+enum InboxStore {
+    static let path = NSHomeDirectory() + "/btmic-inbox.jsonl"
+    static let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
+
+    /// Runs `body` with the queue locked and loaded; saves it afterwards when `body` returns true.
+    @discardableResult
+    static func transact(_ body: (inout [InboxItem]) -> Bool) -> Bool {
+        let fd = open(NSHomeDirectory() + "/.btmic-inbox.lock", O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0, flock(fd, LOCK_EX) == 0 else { return false }
+        defer { flock(fd, LOCK_UN); close(fd) }
+        var items = load()
+        guard body(&items) else { return true }
+        let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var out = Data()
+        for i in items { if let d = try? enc.encode(i) { out += d; out += Data("\n".utf8) } }
+        let tmp = path + ".tmp"
+        guard FileManager.default.createFile(atPath: tmp, contents: out, attributes: [.posixPermissions: 0o600]) else { return false }
+        return rename(tmp, path) == 0
+    }
+
+    static func load() -> [InboxItem] {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+        let dec = JSONDecoder()
+        return raw.split(separator: "\n").compactMap { try? dec.decode(InboxItem.self, from: Data($0.utf8)) }
+    }
+
+    static func makeID(_ text: String) -> String {
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        var h: UInt32 = 5381
+        for b in text.utf8 { h = h &* 33 &+ UInt32(b) }
+        return "\(f.string(from: Date()))-\(String(h, radix: 16).suffix(4))"
+    }
+
+    /// An item whose lease ran out counts as new again.
+    static func available(_ i: InboxItem, now: Date) -> Bool {
+        if i.status == "new" { return true }
+        if i.status == "processing", let l = i.lease_until, let d = iso.date(from: l), d <= now { return true }
+        return false
+    }
+
+    @discardableResult
+    static func add(_ text: String) -> Bool {
+        let item = InboxItem(id: makeID(text), recorded_at: iso.string(from: Date()), text: text)
+        return transact { $0.append(item); return true }
+    }
+}
+
+func inboxCommand(_ a: [String]) -> Never {
+    func opt(_ name: String) -> String? {
+        guard let i = a.firstIndex(of: name), i + 1 < a.count else { return nil }
+        return a[i + 1]
+    }
+    func printJSON(_ i: InboxItem) {
+        let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        if let d = try? enc.encode(i), let s = String(data: d, encoding: .utf8) { print(s) }
+    }
+    let now = Date()
+    let sub = a.first ?? ""
+    let id = a.count > 1 && !a[1].hasPrefix("--") ? a[1] : nil
+    var code: Int32 = 0
+    switch sub {
+    case "add":
+        guard let text = id else { fail("usage: btmic inbox add <text>") }
+        if !InboxStore.add(text) { code = 1 }
+    case "list":
+        let want = opt("--status") ?? "new"
+        let json = a.contains("--json")
+        for i in InboxStore.load() {
+            let ok = want == "all" ? true : (want == "new" ? InboxStore.available(i, now: now) : i.status == want)
+            guard ok else { continue }
+            if json { printJSON(i) } else { print("\(i.id)  \(i.status)  \(i.text.prefix(60))") }
+        }
+    case "claim":
+        let by = opt("--by") ?? "unknown"
+        let minutes = Double(opt("--lease") ?? "") ?? 10
+        var got: InboxItem? = nil
+        InboxStore.transact { items in
+            let idx = items.firstIndex { (id == nil || $0.id == id) && InboxStore.available($0, now: now) }
+            guard let k = idx else { return false }
+            items[k].status = "processing"
+            items[k].handled_by = by
+            items[k].lease_until = InboxStore.iso.string(from: now.addingTimeInterval(minutes * 60))
+            got = items[k]
+            return true
+        }
+        if let g = got { printJSON(g) } else { code = 1 }       // exit 1: nothing to claim
+    case "done":
+        guard let id = id else { fail("usage: btmic inbox done <id> [--result TEXT] [--kind KIND] [--by NAME]") }
+        var found = false
+        InboxStore.transact { items in
+            guard let k = items.firstIndex(where: { $0.id == id }) else { return false }
+            items[k].status = "done"
+            items[k].result = opt("--result") ?? items[k].result
+            items[k].kind = opt("--kind") ?? items[k].kind
+            items[k].handled_by = opt("--by") ?? items[k].handled_by
+            items[k].lease_until = nil
+            items[k].finished_at = InboxStore.iso.string(from: now)
+            found = true
+            return true
+        }
+        if !found { code = 1 }
+    case "release":
+        guard let id = id else { fail("usage: btmic inbox release <id>") }
+        var found = false
+        InboxStore.transact { items in
+            guard let k = items.firstIndex(where: { $0.id == id && $0.status == "processing" }) else { return false }
+            items[k].status = "new"; items[k].lease_until = nil; found = true
+            return true
+        }
+        if !found { code = 1 }
+    default:
+        fail("usage: btmic inbox list [--status new|processing|done|all] [--json] | claim [id] --by NAME [--lease MIN] | done <id> [--result T] [--kind K] | release <id> | add <text>")
+    }
+    exit(code)
+}
 
 // MARK: - BLE receiver (B1)
 
@@ -629,6 +766,8 @@ case "selftest":
 case "probe":
     let probe = Probe()
     withExtendedLifetime(probe) { RunLoop.main.run() }
+case "inbox":
+    inboxCommand(Array(args.dropFirst()))
 case "listen":
     if !takeSingleInstanceLock() { log("btmic is already running, exiting"); exit(0) }
     log("btmic listen started")
@@ -638,5 +777,5 @@ case "listen":
     let listener = Listener(pressReturn: ProcessInfo.processInfo.environment["BTMIC_ENTER"] == "1")
     withExtendedLifetime(listener) { RunLoop.main.run() }
 default:
-    fail("usage: btmic selftest <wav> [--paste] | listen")
+    fail("usage: btmic selftest <wav> [--paste] | listen | inbox ...")
 }

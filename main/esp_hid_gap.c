@@ -27,6 +27,8 @@ extern void ble_presenter_set_state(int st);
 
 #if CONFIG_BT_NIMBLE_ENABLED
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
+#include "esp_timer.h"
 #include "nimble/nimble_port.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs_adv.h"
@@ -816,6 +818,91 @@ esp_err_t esp_hid_ble_gap_adv_init(uint16_t appearance, const char *device_name)
 
 }
 
+/* ---- pairing policy -----------------------------------------------------
+ * With a bond in place the stick refuses every new pairing request (security
+ * level 1 answers "not supported" before any code is shown or anything is
+ * stored). Only a 60 s window opened from the DIAG screen lets a new computer
+ * pair. The bonded Mac itself reconnects with its stored key and is unaffected.
+ * Host calls (ble_hs_cfg / store / terminate) happen only in vox_pair_service(),
+ * which the recording task runs. */
+#define PAIR_WINDOW_US   (60LL * 1000000)
+#define CONN_SQUAT_US    (30LL * 1000000)     /* an unencrypted link this old is holding the slot */
+static volatile bool    s_pair_open_req = false;
+static volatile int64_t s_pair_until_us = 0;  /* 0 = window closed */
+static volatile int     s_bonds = -1;         /* -1 = not counted yet */
+static volatile uint16_t s_cur_conn = BLE_HS_CONN_HANDLE_NONE;
+static volatile int64_t s_cur_conn_us = 0;
+static volatile uint32_t s_sec_rejected = 0;  /* encrypted links dropped for lacking authentication */
+static volatile uint32_t s_pair_failed = 0;
+static volatile int      s_pair_last_err = 0;
+
+void vox_pair_open(void) { s_pair_open_req = true; }
+
+void vox_pair_info(char *buf, size_t n, char *sec, size_t sn)
+{
+    int64_t left = s_pair_until_us ? (s_pair_until_us - esp_timer_get_time()) / 1000000 : 0;
+    if (s_pair_until_us && left > 0) snprintf(buf, n, "PAIR OPEN %dS", (int)left);
+    else if (s_bonds == 0) snprintf(buf, n, "PAIR NOBOND");
+    else snprintf(buf, n, "PAIR CLOSED B%d", s_bonds);
+    snprintf(sec, sn, "SEC J%u F%u E%d", (unsigned)(s_sec_rejected % 100),
+             (unsigned)(s_pair_failed % 100), s_pair_last_err % 1000);
+}
+
+#if !VOX_BLE_JUST_WORKS
+typedef struct { ble_addr_t addr[3]; int n; } sweep_t;
+static int sweep_cb(int obj_type, union ble_store_value *val, void *cookie)
+{
+    (void)obj_type;
+    sweep_t *s = cookie;      /* collect first: the store must not change while it is walked */
+    if (!val->sec.authenticated && s->n < 3) s->addr[s->n++] = val->sec.peer_addr;
+    return 0;
+}
+#endif
+
+void vox_pair_service(void)
+{
+    if (!ble_hs_synced()) return;
+    int64_t now = esp_timer_get_time();
+    static uint8_t base_lvl = 0;
+    if (!base_lvl) base_lvl = ble_hs_cfg.sm_sec_lvl ? ble_hs_cfg.sm_sec_lvl : 2;
+
+#if !VOX_BLE_JUST_WORKS
+    static bool swept = false;
+    if (!swept) {                          /* bonds made without a code (the old Just Works kind) go */
+        swept = true;
+        sweep_t sw = { .n = 0 };
+        ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, sweep_cb, &sw);
+        for (int i = 0; i < sw.n; i++) ble_store_util_delete_peer(&sw.addr[i]);
+    }
+#endif
+    int count = 0;
+    ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &count);
+    s_bonds = count;
+
+    if (s_pair_open_req) {
+        s_pair_open_req = false;
+        s_pair_until_us = now + PAIR_WINDOW_US;
+        if (!ble_gap_adv_active() && s_cur_conn == BLE_HS_CONN_HANDLE_NONE) esp_hid_ble_gap_adv_start();
+    }
+    if (s_pair_until_us && now >= s_pair_until_us) s_pair_until_us = 0;
+
+    bool open = s_pair_until_us != 0 || count == 0;
+#if VOX_BLE_JUST_WORKS
+    ble_hs_cfg.sm_sec_lvl = open ? base_lvl : 1;
+#else
+    ble_hs_cfg.sm_sec_lvl = open ? 3 : 1;          /* 3: refuse a pairing request that does not ask for MITM protection */
+#endif
+
+    /* A link that never encrypts holds the only connection slot. */
+    if (!open && s_cur_conn != BLE_HS_CONN_HANDLE_NONE && now - s_cur_conn_us > CONN_SQUAT_US) {
+        struct ble_gap_conn_desc d;
+        if (ble_gap_conn_find(s_cur_conn, &d) == 0 && !d.sec_state.encrypted) {
+            s_sec_rejected++;
+            ble_gap_terminate(s_cur_conn, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+}
+
 static int
 nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
 {
@@ -829,6 +916,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
                 event->connect.status == 0 ? "established" : "failed",
                 event->connect.status);
         ble_presenter_set_state(event->connect.status == 0 ? 7 : 97);
+        if (event->connect.status == 0) { s_cur_conn = event->connect.conn_handle; s_cur_conn_us = esp_timer_get_time(); }
         if (event->connect.status != 0) {
             // A failed attempt stops advertising and no HIDD disconnect event
             // follows, so the stick would stay invisible until reboot.
@@ -851,6 +939,7 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
         btmic_on_disconnect();
+        s_cur_conn = BLE_HS_CONN_HANDLE_NONE;
 
         return 0;
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -889,6 +978,17 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         /* Encryption has been enabled or disabled for this connection. */
         MODLOG_DFLT(INFO, "encryption change event; status=%d ",
                 event->enc_change.status);
+#if !VOX_BLE_JUST_WORKS
+        if (event->enc_change.status == 0 &&
+            ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0 && !desc.sec_state.authenticated) {
+            /* Encrypted, but paired without the on-screen code (Just Works): not ours. */
+            s_sec_rejected++;
+            ble_presenter_set_state(98);
+            ble_gap_unpair(&desc.peer_id_addr);
+            return 0;
+        }
+#endif
+        if (event->enc_change.status == 0) s_pair_until_us = 0;      /* a pairing succeeded: close the window */
         ble_presenter_set_state(event->enc_change.status == 0 ? 61 : 98);
         rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
         assert(rc == 0);
@@ -899,13 +999,18 @@ nimble_hid_gap_event(struct ble_gap_event *event, void *arg)
         /* One event per notification (about 100 a second while uploading): not logged. */
         return 0;
 
+    case BLE_GAP_EVENT_PARING_COMPLETE:
+        if (event->pairing_complete.status != 0) { s_pair_failed++; s_pair_last_err = event->pairing_complete.status; }
+        return 0;
+
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         /* We already have a bond with the peer, but it is attempting to
          * establish a new secure link.  This app sacrifices security for
          * convenience: just throw away the old bond and accept the new link.
          */
 
-        /* Delete the old bond. */
+        /* A new pairing over an existing bond is only welcome while the window is open. */
+        if (!s_pair_until_us) { s_sec_rejected++; return BLE_GAP_REPEAT_PAIRING_IGNORE; }
         rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
         assert(rc == 0);
         ble_store_util_delete_peer(&desc.peer_id_addr);

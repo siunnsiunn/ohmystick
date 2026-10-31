@@ -1944,7 +1944,7 @@ static void icon_diag(int x, int y, uint16_t fg, uint16_t bg)      // warning tr
     lcd_fill_rect(x + 13, y + 20, x + 16, y + 23, fg);
 }
 
-#define DIAG_LINES 12
+#define DIAG_LINES 14
 static char g_diag_shown[DIAG_LINES][48];
 
 // Redraws one 9 px line only if its text changed.
@@ -1962,8 +1962,11 @@ static void diag_line(int i, const char *s, uint16_t col)
 static uint32_t diag_tick(bool first)
 {
     static const char *ui_name[] = { "NO LINK", "READY", "REC", "BUSY", "DONE", "ERR", "REC OFF", "SYNC", "FULL" };
+    static bool was_held = false;
+    if (g_passkey_hold_until != 0) { was_held = true; return 200; }   // the pairing code owns the screen
+    if (was_held) { was_held = false; lcd_clear_locked(); first = true; }
     if (first) memset(g_diag_shown, 0, sizeof(g_diag_shown));
-    char s[48], d[24];
+    char s[48], d[24], s2[32];
     int ui = (int)btmic_ui_state();
     snprintf(s, sizeof(s), "LINK %s", ui >= 0 && ui < 9 ? ui_name[ui] : "?");
     diag_line(0, s, COL_CYAN);
@@ -1988,15 +1991,18 @@ static uint32_t diag_tick(bool first)
     diag_line(7, s, COL_LIGHT_GRAY);
     snprintf(s, sizeof(s), "QUIET MAX D%d B%d R%d S", g_hb_stuck_max[0], g_hb_stuck_max[1], g_hb_stuck_max[2]);
     diag_line(10, s, g_hb_stuck_max[0] >= 4 || g_hb_stuck_max[1] >= 4 || g_hb_stuck_max[2] >= 5 ? COL_YELLOW : COL_LIGHT_GRAY);
+    vox_pair_info(s, sizeof(s), s2, sizeof(s2));
+    diag_line(11, s, strstr(s, "OPEN") ? COL_YELLOW : COL_LIGHT_GRAY);
+    diag_line(12, s2, COL_LIGHT_GRAY);
     if (g_fault_reason) {
         snprintf(s, sizeof(s), "LAST RESET R%d", g_fault_reason % 100);
         diag_line(8, s, COL_RED);
         snprintf(s, sizeof(s), "C%05u %s", (unsigned)(g_fault_crumb % 100000), g_fault_who);
         diag_line(9, s, COL_RED);
-        diag_line(11, "FRONT CLEARS  SIDE BACK", COL_LIGHT_GRAY);
+        diag_line(13, "FRONT CLEARS  HOLD=PAIR", COL_LIGHT_GRAY);
     } else {
         diag_line(8, "LAST RESET NONE", COL_GREEN);
-        diag_line(11, "SIDE BACK", COL_LIGHT_GRAY);
+        diag_line(13, "HOLD FRONT 2S = PAIR", COL_LIGHT_GRAY);
     }
     return 1000;
 }
@@ -2006,6 +2012,12 @@ static void diag_front_down(void)                 // front button: mark the rese
     g_fault_reason = 0;
     g_batt_dbg = 0;
     g_bar_dirty = true;
+}
+
+static void diag_front_up(uint32_t held_ms, bool is_long)   // held 2 s: let a new computer pair for 60 s
+{
+    (void)is_long;
+    if (held_ms >= 2000) vox_pair_open();
 }
 
 static const app_t app_usb_mic = {
@@ -2039,7 +2051,7 @@ static const app_t app_slide = {
 static const app_t app_diag = {
     .name = "DIAG", .color = COL_RED, .icon = icon_diag,
     .flags = APP_BLE,                                      // BLE up so LINK and UPLOAD mean something
-    .tick = diag_tick, .front_down = diag_front_down,
+    .tick = diag_tick, .front_down = diag_front_down, .front_up = diag_front_up,
 };
 
 static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide, &app_diag };

@@ -153,12 +153,20 @@ static const struct ble_gatt_svc_def k_svcs[] = {
                 .uuid = &k_audio_uuid.u,
                 .access_cb = audio_access,
                 .val_handle = &s_audio_handle,
-                .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC,
+                .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC
+#if !VOX_BLE_JUST_WORKS
+                         | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN        // subscribing needs an authenticated link
+#endif
+                         ,
             },
             {
                 .uuid = &k_ctrl_uuid.u,
                 .access_cb = ctrl_access,
-                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC
+#if !VOX_BLE_JUST_WORKS
+                         | BLE_GATT_CHR_F_WRITE_AUTHEN
+#endif
+                         ,
             },
             { 0 },
         },
@@ -199,6 +207,9 @@ static bool link_compute(void)
     if (!s_ping_seen || (xTaskGetTickCount() - s_last_ping) > pdMS_TO_TICKS(PEER_ALIVE_MS)) return false;
     struct ble_gap_conn_desc d;
     if (ble_gap_conn_find(s_conn, &d) != 0 || !d.sec_state.encrypted) return false;
+#if !VOX_BLE_JUST_WORKS
+    if (!d.sec_state.authenticated || !d.sec_state.bonded) return false;   // paired with the on-screen code only
+#endif
     return ble_att_mtu(s_conn) >= MIN_ATT_MTU;
 }
 
@@ -403,6 +414,7 @@ static void rec_task(void *arg)
         vox_hb_rec++;
         link_refresh();
         ack_service();
+        vox_pair_service();
         // Short idle tick while there is erasing to do or a Mac to talk to, slow otherwise.
         TickType_t wait = (s_maint_ok && inbox_maintain_needed()) ? pdMS_TO_TICKS(60) : pdMS_TO_TICKS(1000);
         if (s_sub && wait > pdMS_TO_TICKS(200)) wait = pdMS_TO_TICKS(200);

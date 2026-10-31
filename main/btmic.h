@@ -36,6 +36,11 @@ void btmic_on_disconnect(void);
 void       btmic_set_mode(bool sync_ok, bool maintain_ok);
 int        btmic_pending(void);     // recordings stored on the stick
 void       btmic_debug(char *buf, size_t n);   // short upload diagnostics for the screen
+// Pairing policy (esp_hid_gap.c). vox_pair_open() only sets a flag, so any task may call it;
+// vox_pair_service() touches the host and is run by the recording task.
+void vox_pair_open(void);
+void vox_pair_service(void);
+void vox_pair_info(char *buf, size_t n, char *sec, size_t sn);
 extern volatile uint32_t vox_crumb;
 extern volatile uint32_t vox_hb_rec;            // last activity marker; checked by the monitor task
 
