@@ -233,7 +233,38 @@ func saveToInbox(_ text: String) -> Bool {
     }
     InboxStore.add(text)                       // same text for agents; the .md stays for reading
     log("saved to \(path)")
+    copyToCloud(text)                          // optional, off unless a folder is configured
     return true
+}
+
+/// Opt-in copy of each note to a folder that a sync service watches (for example iCloud
+/// Drive), so the phone sees it. Enabled by BTMIC_CLOUD_DIR or a one-line ~/.btmic-cloud-dir.
+/// One small file per note, so two devices never edit the same file. Failure only logs:
+/// the local save already succeeded and the Stick may delete its copy.
+func cloudDir() -> String? {
+    var d = ProcessInfo.processInfo.environment["BTMIC_CLOUD_DIR"] ?? ""
+    if d.isEmpty, let s = try? String(contentsOfFile: NSHomeDirectory() + "/.btmic-cloud-dir", encoding: .utf8) {
+        d = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if d.isEmpty { return nil }
+    return (d as NSString).expandingTildeInPath
+}
+
+func copyToCloud(_ text: String) {
+    guard let dir = cloudDir() else { return }
+    let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+    let stamp = f.string(from: Date())
+    var h: UInt32 = 5381
+    for b in text.utf8 { h = (h &* 33) ^ UInt32(b) }                    // short tag so same-second notes differ
+    let file = dir + "/note-\(stamp)-\(String(h, radix: 16)).md"
+    do {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try Data("# \(stamp)\n\n\(text)\n".utf8).write(to: URL(fileURLWithPath: file), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file)
+        log("copied to cloud folder")
+    } catch {
+        log("cloud copy failed: \(error.localizedDescription)")
+    }
 }
 
 /// Copies to the clipboard, and pastes (Cmd+V, optional Return) only when this

@@ -42,3 +42,16 @@
 - outbox 檔名用 `id`，檔案權限 0600；成功後用 `removeItem` 刪除。
 - 記錄只寫字數，沿用 `BTMIC_LOG_TEXT` 的規則。
 - 驗收：關網路錄一筆 NOTE 補傳，Stick 仍收到 DONE；恢復網路後雲端出現一筆；重複重送雲端仍只有一筆。
+
+## 已實作：iCloud 資料夾複本（選用，預設關閉）
+
+`btmic` 在存好本機收件夾之後，若設定了資料夾，就多寫一份「一筆一檔」的 Markdown（`note-日期-時間-雜湊.md`，權限 0600）。失敗只記錄，不影響本機儲存與回 DONE。
+
+開啟（擇一）：
+
+```
+echo '~/Library/Mobile Documents/com~apple~CloudDocs/Stick收件夾' > ~/.btmic-cloud-dir
+launchctl kickstart -k gui/$(id -u)/local.btmic
+```
+
+或在 LaunchAgent 的環境變數設 `BTMIC_CLOUD_DIR`。關閉：刪掉 `~/.btmic-cloud-dir`。注意：開啟後語音筆記的內容會進 iCloud，看診口述請走 WHISPER 而不是 NOTE。

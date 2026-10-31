@@ -126,6 +126,7 @@ out/btmic.app/Contents/MacOS/btmic selftest <16k 單聲道 wav>   # 離線自測
 ```
 
 補傳的離線錄音文字在 `~/btmic-inbox.md`（每筆附日期與時間）。
+給 agent 處理的佇列是 `~/btmic-inbox.jsonl`，用 `tools/btmic/inbox list|claim|done|release|add` 操作，流程見 `docs/INBOX.md`。Stick 的狀態頁怎麼讀見 `docs/DIAG.md`；要把筆記同步到 iCloud 見 `docs/NOTE-CLOUD.md` 最後一節。
 
 ### 常駐與詞彙
 
