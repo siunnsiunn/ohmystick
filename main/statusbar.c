@@ -2,7 +2,8 @@
 #include "vox_internal.h"
 
 // ---- Status bar (top 20 px): battery, charging, Bluetooth link ---------------
-int           g_batt_pct    = -1;       // -1 = unknown
+int           g_batt_pct    = -1;
+volatile TickType_t g_batt_good_tick = 0;   // when a trustworthy reading last arrived (0 = none since boot)       // -1 = unknown
 bool          g_batt_ext    = false;    // running from USB power
 static bool          g_bar_ble     = false;
 static int           g_bar_shown_pct = -2;
@@ -31,17 +32,19 @@ static void statusbar_paint(void)
         int w = (20 * g_batt_pct) / 100;
         if (w < 1) w = 1;
         lcd_fill_rect(6, 6, 6 + w, 13, col);
-        char s[6];
-        snprintf(s, sizeof(s), "%d%%", g_batt_pct);
+        char s[8];
+        // "~" in front: the chip has not answered sensibly for a while, so this is the last good value
+        snprintf(s, sizeof(s), battery_is_estimate() ? "~%d%%" : "%d%%", g_batt_pct);
         lcd_draw_text(36, 3, s, 2, col);
+        int tw = lcd_text_width(s, 2);
         if (g_batt_ext) {                       // lightning bolt
-            int bx = 36 + lcd_text_width(s, 2) + 6;
+            int bx = 36 + tw + 6;
             lcd_draw_thick_line(bx + 4, 3, bx, 10, 1, COL_YELLOW);
             lcd_draw_thick_line(bx, 10, bx + 5, 10, 1, COL_YELLOW);
             lcd_draw_thick_line(bx + 5, 10, bx + 1, 17, 1, COL_YELLOW);
         }
     } else {
-        lcd_draw_text(36, 3, "--", 2, 0x7BEF);
+        zh_text(36, 4, "電量未知", 0x7BEF, COL_BLACK, 1);   // no trustworthy reading yet (typical on battery power)
     }
     if (g_fault_reason) {                       // the stick reset itself: open DIAG
         lcd_draw_text(94, 6, "!", 2, COL_RED);

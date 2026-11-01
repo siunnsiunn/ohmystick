@@ -71,8 +71,34 @@ static esp_err_t pmic_read_n(uint8_t reg, uint8_t *out, size_t n)
 #define BATT_EMPTY_MV 3300
 #define BATT_FULL_MV  4100
 
+// A reading older than this is shown as an estimate ("約"). On battery power the chip
+// often answers with nonsense, so the last good value is all there is.
+#define BATT_FRESH_MS 60000
+// Raw control registers for the details page, to see what differs between a battery boot
+// (battery voltage unreadable) and after a USB plug-in (readable). Reads only.
+void pmic_regs_text(char *buf, size_t n)
+{
+    static const uint8_t regs[] = { 0x04, 0x06, 0x09, 0x2A };
+    int len = snprintf(buf, n, "PM");
+    for (size_t i = 0; i < sizeof(regs) && len > 0 && (size_t)len < n; i++) {
+        uint8_t v = 0;
+        if (pmic_read_n(regs[i], &v, 1) == ESP_OK) len += snprintf(buf + len, n - len, " %02X:%02X", regs[i], v);
+        else len += snprintf(buf + len, n - len, " %02X:--", regs[i]);
+    }
+}
+
+bool battery_is_estimate(void)
+{
+    return g_batt_pct >= 0 && g_batt_good_tick != 0 &&
+           pdTICKS_TO_MS(xTaskGetTickCount() - g_batt_good_tick) > BATT_FRESH_MS;
+}
+
 void battery_sample(void)
 {
+    // While the chip keeps answering nonsense, ask less often and with fewer retries:
+    // each attempt holds up the display task.
+    static int s_odd_streak = 0, s_skip = 0;
+    if (s_odd_streak >= 3 && (s_skip++ % 6) != 0) return;
     uint8_t v[2] = {0}, src = 0xFF;
     // The codec shares this I2C bus, so a read can fail while it is busy. Try a few
     // times; if it still fails keep showing the last good value, and after repeated
@@ -81,7 +107,7 @@ void battery_sample(void)
     // While the radio is busy the chip sometimes answers with nonsense (about 12 mV
     // was seen), so a reading outside the plausible range is retried like an error.
     esp_err_t e = ESP_FAIL;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < (s_odd_streak >= 3 ? 2 : 6); i++) {
         if (i) vTaskDelay(pdMS_TO_TICKS(60));
         e = pmic_read_n(0x22, v, 2);
         int m = v[0] | ((v[1] & 0x0F) << 8);
@@ -110,7 +136,10 @@ void battery_sample(void)
     }
     if (mv < 2500 || mv > 4600) {                          // implausible: keep the last good reading
         g_batt_dbg = 10000 + (mv % 10000);
+        s_odd_streak++;
     } else {
+        s_odd_streak = 0;
+        g_batt_good_tick = xTaskGetTickCount() ? xTaskGetTickCount() : 1;
         g_batt_dbg = 0;
         g_batt_mv = mv;
         int pct = (mv - BATT_EMPTY_MV) * 100 / (BATT_FULL_MV - BATT_EMPTY_MV);

@@ -70,6 +70,8 @@ static uint32_t diag_tick_details(bool first)
         diag_line(13, "FRONT BACK  HOLD PAIR", COL_LIGHT_GRAY);
     } else {
         diag_line(8, "LAST RESET NONE", COL_GREEN);
+        pmic_regs_text(s, sizeof(s));
+        diag_line(9, s, COL_LIGHT_GRAY);
         diag_line(13, "FRONT BACK  HOLD PAIR", COL_LIGHT_GRAY);
     }
     return 1000;
@@ -117,8 +119,8 @@ static uint32_t diag_tick_summary(bool first)
     if (pending > 0) snprintf(v, sizeof(v), "%d 筆", pending % 100); else snprintf(v, sizeof(v), "無");
     diag_sum_row(2, y, "待傳筆記", v, pending > 0 ? COL_YELLOW : COL_GREEN, 1);
     y += 24;
-    if (batt_known) snprintf(v, sizeof(v), "%d%% %s", g_batt_pct, g_batt_ext ? "充電中" : "電池");
-    else snprintf(v, sizeof(v), "量測中");
+    if (batt_known) snprintf(v, sizeof(v), "%s%d%% %s", battery_is_estimate() ? "約" : "", g_batt_pct, g_batt_ext ? "充電中" : "電池");
+    else snprintf(v, sizeof(v), g_batt_ext ? "量測中" : "插 USB 才能量");
     diag_sum_row(3, y, "電量", v, !batt_known ? COL_YELLOW : (batt_low ? COL_RED : COL_GREEN), 1);
     y += 24;
     if (pair == 1) snprintf(v, sizeof(v), "開放 %d 秒", left);
