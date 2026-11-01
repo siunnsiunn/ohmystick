@@ -836,7 +836,18 @@ static volatile uint32_t s_sec_rejected = 0;  /* encrypted links dropped for lac
 static volatile uint32_t s_pair_failed = 0;
 static volatile int      s_pair_last_err = 0;
 
+static volatile bool s_clear_req = false;
 void vox_pair_open(void) { s_pair_open_req = true; }
+void vox_pair_clear_all(void) { s_clear_req = true; s_pair_open_req = true; }
+
+typedef struct { ble_addr_t addr[8]; int n; } all_bonds_t;
+static int all_bonds_cb(int obj_type, union ble_store_value *val, void *cookie)
+{
+    (void)obj_type;
+    all_bonds_t *s = cookie;   /* collect first: the store must not change while it is walked */
+    if (s->n < 8) s->addr[s->n++] = val->sec.peer_addr;
+    return 0;
+}
 
 int vox_pair_status(int *left_s)
 {
@@ -883,6 +894,14 @@ void vox_pair_service(void)
         for (int i = 0; i < sw.n; i++) ble_store_util_delete_peer(&sw.addr[i]);
     }
 #endif
+    if (s_clear_req) {                     /* "forget everything": every bond goes, and the current link is dropped */
+        s_clear_req = false;
+        all_bonds_t all = { .n = 0 };
+        ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, all_bonds_cb, &all);
+        for (int i = 0; i < all.n; i++) ble_store_util_delete_peer(&all.addr[i]);
+        if (s_cur_conn != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(s_cur_conn, BLE_ERR_REM_USER_CONN_TERM);
+        ESP_LOGW(TAG, "all %d bonds cleared", all.n);
+    }
     int count = 0;
     ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &count);
     s_bonds = count;

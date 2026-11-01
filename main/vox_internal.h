@@ -173,6 +173,7 @@ void button_task(void *arg);
 void icon_diag(int x, int y, uint16_t fg, uint16_t bg);
 uint32_t diag_tick(bool first);
 void diag_front_up(uint32_t held_ms, bool is_long);
+void diag_front_down(void);
 void vad_lcd_task(void *arg);
 void enter_rom_download_mode(const char *reason);
 bool host_download_allowed(void);

@@ -40,6 +40,7 @@ void       btmic_debug(char *buf, size_t n);   // short upload diagnostics for t
 // vox_pair_service() touches the host and is run by the recording task.
 void vox_pair_open(void);
 void vox_pair_service(void);
+void vox_pair_clear_all(void);       // forget every bonded device (and open the pairing window); done by vox_pair_service()
 int  vox_pair_status(int *left_s);   // 0 locked, 1 window open (seconds left), 2 nothing paired yet
 void vox_pair_info(char *buf, size_t n, char *sec, size_t sn);
 extern volatile uint32_t vox_crumb;

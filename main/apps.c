@@ -166,7 +166,7 @@ const app_t app_slide = {
 static const app_t app_diag = {
     .name = "DIAG", .name_zh = "狀態", .desc_zh = "診斷與配對", .color = COL_RED, .icon = icon_diag,
     .flags = APP_BLE,                                      // BLE up so LINK and UPLOAD mean something
-    .tick = diag_tick, .front_up = diag_front_up,
+    .tick = diag_tick, .front_down = diag_front_down, .front_up = diag_front_up,
 };
 
 static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide, &app_diag };

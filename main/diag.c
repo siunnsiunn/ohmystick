@@ -146,9 +146,45 @@ static uint32_t diag_tick_summary(bool first)
     return 1000;
 }
 
+static volatile bool g_diag_pressed = false;
+static volatile TickType_t g_diag_press_tick = 0;
+void diag_front_down(void) { g_diag_press_tick = xTaskGetTickCount(); g_diag_pressed = true; }
+
+// While the button is held past 2 s the page is replaced by what releasing now will do.
+static bool diag_hold_overlay(void)
+{
+    if (!g_diag_pressed) return false;
+    uint32_t held = pdTICKS_TO_MS(xTaskGetTickCount() - g_diag_press_tick);
+    if (held < 2000) return false;
+    static int last = -1;
+    int stage = held >= 6000 ? 99 : (int)((6000 - held) / 1000) + 1;       // 99: ready to clear
+    if (stage != last) {
+        last = stage;
+        lcd_clear_locked();
+        xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+        if (stage == 99) {
+            zh_center(60, "放開", COL_RED, 3);
+            zh_center(110, "清除全部配對", COL_RED, 2);
+            zh_center(150, "電腦和手機", COL_LIGHT_GRAY, 1);
+            zh_center(166, "都要重新配對", COL_LIGHT_GRAY, 1);
+        } else {
+            char s[24];
+            zh_center(50, "放開", COL_YELLOW, 2);
+            zh_center(80, "開啟配對", COL_YELLOW, 2);
+            snprintf(s, sizeof(s), "再按住 %d 秒", stage);
+            zh_center(130, s, COL_LIGHT_GRAY, 1);
+            zh_center(150, "清除全部配對", COL_LIGHT_GRAY, 1);
+        }
+        xSemaphoreGive(g_pres_lcd_mu);
+    }
+    return true;
+}
+
 uint32_t diag_tick(bool first)
 {
-    static bool was_details = false, was_held = false;
+    static bool was_details = false, was_held = false, was_overlay = false;
+    if (diag_hold_overlay()) { was_overlay = true; return 100; }
+    if (was_overlay) { was_overlay = false; lcd_clear_locked(); first = true; }
     if (g_passkey_hold_until != 0) { was_held = true; return 200; }  // the pairing code owns the screen
     if (was_held) { was_held = false; lcd_clear_locked(); first = true; }
     if (first) was_details = g_diag_details = false;
@@ -163,6 +199,8 @@ uint32_t diag_tick(bool first)
 void diag_front_up(uint32_t held_ms, bool is_long)   // short: summary <-> details; held 2 s: let a new computer pair for 60 s
 {
     (void)is_long;
+    g_diag_pressed = false;
+    if (held_ms >= 6000) { vox_pair_clear_all(); return; }          // forget every device, then let one pair
     if (held_ms >= 2000) { vox_pair_open(); return; }
     // The reset notice stays until it has been looked at on the details page and that page is left.
     if (g_diag_details) { g_fault_reason = 0; g_batt_dbg = 0; g_bar_dirty = true; }
