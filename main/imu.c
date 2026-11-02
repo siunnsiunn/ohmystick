@@ -99,6 +99,27 @@ esp_err_t imu_init(void)
     return ESP_OK;
 }
 
+// Turning the stick over (like an hourglass): the gravity vector in the screen plane points
+// the opposite way. Counted here so apps only watch g_imu_flips. A reference direction is kept
+// while the stick is held on its edge (gravity in the plane > 0.7 g); lying flat does not change it.
+volatile uint32_t g_imu_flips = 0;
+#define IMU_EDGE_MIN_LSB   11500
+static void imu_flip_update(int32_t x, int32_t y)
+{
+    static int32_t rx = 0, ry = 0;
+    static int against = 0;
+    int64_t mag2 = (int64_t)x * x + (int64_t)y * y;
+    if (mag2 < (int64_t)IMU_EDGE_MIN_LSB * IMU_EDGE_MIN_LSB) { against = 0; return; }   // flat or tilted: no direction
+    if (rx == 0 && ry == 0) { rx = x; ry = y; return; }
+    int64_t dot = (int64_t)x * rx + (int64_t)y * ry;
+    if (dot < 0) {
+        if (++against >= 2) { against = 0; rx = x; ry = y; g_imu_flips++; ESP_LOGI(TAG, "imu: flipped"); }
+    } else {
+        against = 0;
+        if (dot > 0 && mag2 > 0) { rx = x; ry = y; }          // follow slow turns so only a real flip counts
+    }
+}
+
 void imu_task(void *arg)
 {
     struct bmi2_sens_data data = {0};
@@ -109,6 +130,7 @@ void imu_task(void *arg)
             // Convention: stick lying flat (face up or face down) on a
             // table -> |z| dominates. Pick it up to portrait or any
             // tilted orientation -> |z| drops, |x|/|y| dominate.
+            imu_flip_update(data.acc.x, data.acc.y);
             int16_t z = data.acc.z;
             int32_t az = (z < 0) ? -(int32_t)z : (int32_t)z;
             bool flat;

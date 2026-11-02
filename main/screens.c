@@ -49,7 +49,7 @@ void lcd_draw_menu(int sel, int prev)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
-// Words for the BLE bring-up state, shared by the BT DICT and SLIDE screens.
+// Words for the BLE bring-up state, shared by the SLIDE screen and the voice screens.
 static void ble_status_words(const char **word, uint16_t *col, int *scale, char *code, size_t n)
 {
     int st = ble_presenter_state();
@@ -59,22 +59,6 @@ static void ble_status_words(const char **word, uint16_t *col, int *scale, char 
     else if (st >= 90)                 { *word = "藍牙錯誤"; *col = COL_RED; *scale = 2; snprintf(code, n, "代碼 %d", st); }
     else if (st == 8)                  { *word = "輸入配對碼"; *col = COL_YELLOW; *scale = 1; }
     else                               { *word = "等待連線"; *col = COL_ORANGE; *scale = 2; }
-}
-
-void lcd_draw_ble_dictation(void)
-{
-    if (!g_lcd) return;
-    const char *word; uint16_t col; int scale; char code[16];
-    ble_status_words(&word, &col, &scale, code, sizeof(code));
-    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
-    lcd_clear(COL_BLACK);
-    zh_center(36, "藍牙聽寫", COL_LIGHT_GRAY, 2);
-    zh_center((LCD_H - 12 * scale) / 2, word, col, scale);
-    if (code[0]) zh_center(140, code, COL_RED, 1);
-    zh_center(190, "前鍵 觸發聽寫快捷鍵", COL_LIGHT_GRAY, 1);
-    zh_center(206, "按住前鍵 回選單", COL_LIGHT_GRAY, 1);
-    statusbar_paint_if_dirty();
-    xSemaphoreGive(g_pres_lcd_mu);
 }
 
 // Presenter/mic screens only repaint the middle band, so wipe the whole panel

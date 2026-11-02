@@ -112,15 +112,6 @@ void lcd_icon_mic(int x, int y, uint16_t c)
     lcd_draw_thick_line(x + 9, y + 26, x + 19, y + 26, 2, c);
 }
 
-void lcd_icon_bluetooth(int x, int y, uint16_t c)
-{
-    static const int8_t pts[][2] = {{6, 19}, {22, 9}, {14, 2}, {14, 26}, {22, 19}, {6, 9}};
-    for (int i = 0; i + 1 < 6; i++) {
-        lcd_draw_thick_line(x + pts[i][0], y + pts[i][1],
-                            x + pts[i + 1][0], y + pts[i + 1][1], 2, c);
-    }
-}
-
 void lcd_icon_record(int x, int y, uint16_t c, uint16_t bg)
 {
     lcd_fill_circle(x + 14, y + 14, 13, c);                    // ring

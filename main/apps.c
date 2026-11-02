@@ -8,7 +8,6 @@
 vox_config_wire_t g_press_cfg;          // config snapshot taken when BtnA went down
 
 static void icon_mic(int x, int y, uint16_t fg, uint16_t bg)       { (void)bg; lcd_icon_mic(x, y, fg); }
-static void icon_bluetooth(int x, int y, uint16_t fg, uint16_t bg) { (void)bg; lcd_icon_bluetooth(x, y, fg); }
 static void icon_note(int x, int y, uint16_t fg, uint16_t bg)      { lcd_icon_record(x, y, fg, bg); }
 static void icon_slide(int x, int y, uint16_t fg, uint16_t bg)     { (void)bg; lcd_icon_slide(x, y, fg); }
 static void icon_whisper(int x, int y, uint16_t fg, uint16_t bg)   // speech bubble with three dots
@@ -76,8 +75,8 @@ static void usb_mic_front_up(uint32_t held, bool is_long)
     if (!g_vad_display_enabled) lcd_status(g_codec_ready ? COL_GREEN : COL_RED);
 }
 
-// ---- BT DICT / SLIDE: BLE keyboard screens -------------------------------------
-static uint32_t ble_screen_tick(bool first, bool slide)
+// ---- SLIDE: BLE keyboard screen -------------------------------------
+static uint32_t ble_screen_tick(bool first)
 {
     static bool last_up = false, force = true;
     static int last_st = -1;
@@ -99,14 +98,11 @@ static uint32_t ble_screen_tick(bool first, bool slide)
     int st = ble_presenter_state();
     if (force || up != last_up || st != last_st) {
         force = false; last_up = up; last_st = st;
-        if (slide) lcd_draw_presenter();
-        else       lcd_draw_ble_dictation();
+        lcd_draw_presenter();
     }
     return VAD_FRAME_MS;
 }
-static uint32_t bt_dict_tick(bool first) { return ble_screen_tick(first, false); }
-static uint32_t slide_tick(bool first)   { return ble_screen_tick(first, true); }
-static void bt_dict_front_up(uint32_t held, bool is_long) { (void)held; send_keys(true, false, is_long); }
+static uint32_t slide_tick(bool first)   { return ble_screen_tick(first); }
 static void slide_front_up(uint32_t held, bool is_long)   { (void)held; send_keys(true, true, is_long); }
 static void slide_side_down(void)                         // side button = previous slide
 {
@@ -140,11 +136,6 @@ static const app_t app_usb_mic = {
     .flags = APP_NO_SLEEP | APP_USB_MIC | APP_HOLD_EXITS,
     .tick = usb_mic_tick, .front_down = usb_mic_front_down, .front_up = usb_mic_front_up,
 };
-const app_t app_bt_dict = {
-    .name = "BT DICT", .name_zh = "藍牙聽寫", .desc_zh = "藍牙鍵盤輸入", .color = COL_GREEN, .icon = icon_bluetooth,
-    .flags = APP_NO_SLEEP | APP_BLE | APP_HOLD_EXITS,
-    .tick = bt_dict_tick, .front_up = bt_dict_front_up,
-};
 static const app_t app_whisper = {
     .name = "WHISPER", .name_zh = "即時聽寫", .desc_zh = "邊說邊貼上", .color = COL_MAGENTA, .icon = icon_whisper,
     .flags = APP_BLE,
@@ -169,6 +160,6 @@ static const app_t app_diag = {
     .tick = diag_tick, .front_down = diag_front_down, .front_up = diag_front_up,
 };
 
-static const app_t *const k_apps[] = { &app_usb_mic, &app_bt_dict, &app_whisper, &app_note, &app_slide, &app_diag };
+static const app_t *const k_apps[] = { &app_usb_mic, &app_whisper, &app_note, &app_slide, &app_timer, &app_diag };
 const app_t *launcher_app(int i)  { return k_apps[i]; }
 int          launcher_count(void) { return (int)(sizeof(k_apps) / sizeof(k_apps[0])); }

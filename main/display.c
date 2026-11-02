@@ -45,10 +45,10 @@ void vad_lcd_task(void *arg)
         const app_t *a = g_cur;
         int sel = g_menu_sel;
         g_hb_disp++;
-        // A pairing code stays up until pairing ends. Only the two keyboard screens
-        // clear it themselves; anywhere else it would hide the status bar and block
+        // A pairing code stays up until pairing ends. Only the presenter screen
+        // clears it itself; anywhere else it would hide the status bar and block
         // screen sleep for good.
-        if (g_passkey_hold_until != 0 && a != &app_bt_dict && a != &app_slide) {
+        if (g_passkey_hold_until != 0 && a != &app_slide) {
             int s = ble_presenter_state();
             if (s == 61 || s == 98 || (int32_t)(xTaskGetTickCount() - g_passkey_hold_until) >= 0) {
                 g_passkey_hold_until = 0;
