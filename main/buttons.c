@@ -136,87 +136,90 @@ void hid_send_tap(uint8_t modifier, uint8_t keycode)
 }
 
 
+// A level change counts once it has held for BTN_DEBOUNCE_TICKS polls in a row.
+typedef struct { bool committed, pending; int stable; } debounce_t;     // levels: true = released (pull-up)
+
+// Returns true when the committed level just changed; the new level is in d->committed.
+static bool debounce(debounce_t *d, bool level)
+{
+    if (level != d->pending) { d->pending = level; d->stable = 0; return false; }
+    if (d->stable < BTN_DEBOUNCE_TICKS) { d->stable++; return false; }
+    if (d->pending == d->committed) return false;
+    d->committed = d->pending;
+    return true;
+}
+
+// Side button: the menu's "next", otherwise the running app's side action (default: back to the menu).
+static void side_button_pressed(void)
+{
+    const app_t *cur = g_cur;
+    vox_where_btn = 3;
+    if (!cur) {
+        g_menu_sel = (g_menu_sel + 1) % launcher_count();
+        ESP_LOGI(TAG, "menu selection -> %d", (int)g_menu_sel);
+    } else if (cur->side_down) {
+        cur->side_down();
+    } else {
+        enter_app(NULL);
+    }
+}
+
+static TickType_t g_front_press_start;
+static bool       g_front_long_latched;   // the current hold has crossed the long-press threshold
+
+static void front_button_pressed(void)
+{
+    g_front_press_start = xTaskGetTickCount();
+    vox_config_get(&g_press_cfg);
+    g_front_long_latched = false;
+    ESP_LOGI(TAG, "btn A down");
+    const app_t *cur = g_cur;
+    vox_where_btn = 1;
+    if (cur && cur->front_down) cur->front_down();
+}
+
+// Released: decide what the press meant from how long it was held.
+static void front_button_released(void)
+{
+    uint32_t held_ms = pdTICKS_TO_MS(xTaskGetTickCount() - g_front_press_start);
+    bool is_long = held_ms >= g_press_cfg.long_press_ms;
+    const app_t *cur = g_cur;
+    vox_where_btn = 2;
+    if (!cur) {
+        enter_app(launcher_app(g_menu_sel));                 // any press length opens the highlighted app
+    } else if ((cur->flags & APP_HOLD_EXITS) && held_ms >= MODE_TOGGLE_MS) {
+        enter_app(NULL);                                     // back to the menu
+    } else if (cur->front_up) {
+        cur->front_up(held_ms, is_long);
+    }
+}
+
+// While still held, switch the screen colour once the long-press threshold is crossed,
+// so the user sees that releasing now counts as a long press.
+static void front_button_held(void)
+{
+    if (g_front_long_latched) return;
+    if (pdTICKS_TO_MS(xTaskGetTickCount() - g_front_press_start) < g_press_cfg.long_press_ms) return;
+    g_front_long_latched = true;
+    const app_t *cur = g_cur;
+    if (cur && (cur->flags & APP_USB_MIC) && !g_vad_display_enabled) lcd_status(COL_BLUE);
+}
+
 void button_task(void *arg)
 {
     (void)arg;
-    bool a_committed = true;     // released = high
-    bool a_pending   = true;
-    int  a_stable    = 0;
-    TickType_t a_press_start = 0;
-    bool       a_long_latched = false;  // true once the press has crossed
-                                        // the long threshold this hold
-
-    bool b_committed = true;     // released = high
-    bool b_pending   = true;
-    int  b_stable    = 0;
-
+    debounce_t front = { true, true, 0 }, side = { true, true, 0 };
     while (1) {
         g_hb_btn++;
         vox_where_btn = 0;
-        if (!gpio_get_level(BTN_A_GPIO) || !gpio_get_level(BTN_B_GPIO)) {
-            g_last_activity = xTaskGetTickCount();     // wakes a sleeping screen
-        }
-        bool b = gpio_get_level(BTN_B_GPIO);
-        if (b != b_pending) { b_pending = b; b_stable = 0; }
-        else if (b_stable < BTN_DEBOUNCE_TICKS) { b_stable++; }
-        else if (b_pending != b_committed) {
-            b_committed = b_pending;
-            if (!b_committed) {
-                const app_t *cur = g_cur;
-                vox_where_btn = 3;
-                if (!cur) {
-                    g_menu_sel = (g_menu_sel + 1) % launcher_count();
-                    ESP_LOGI(TAG, "menu selection -> %d", (int)g_menu_sel);
-                } else if (cur->side_down) {
-                    cur->side_down();
-                } else {
-                    enter_app(NULL);                   // default: side button = back
-                }
-            }
-        }
+        bool front_level = gpio_get_level(BTN_A_GPIO), side_level = gpio_get_level(BTN_B_GPIO);
+        if (!front_level || !side_level) g_last_activity = xTaskGetTickCount();     // wakes a sleeping screen
 
-        bool a = gpio_get_level(BTN_A_GPIO);
-
-        if (a != a_pending) { a_pending = a; a_stable = 0; }
-        else if (a_stable < BTN_DEBOUNCE_TICKS) { a_stable++; }
-        else if (a_pending != a_committed) {
-            a_committed = a_pending;
-            if (!a_committed) {
-                // Just pressed.
-                a_press_start = xTaskGetTickCount();
-                vox_config_get(&g_press_cfg);
-                a_long_latched = false;
-                ESP_LOGI(TAG, "btn A down");
-                const app_t *cur = g_cur;
-                vox_where_btn = 1;
-                if (cur && cur->front_down) cur->front_down();
-            } else {
-                // Just released — decide what this press means.
-                uint32_t held_ms = pdTICKS_TO_MS(xTaskGetTickCount() - a_press_start);
-                bool is_long = held_ms >= g_press_cfg.long_press_ms;
-                const app_t *cur = g_cur;
-                vox_where_btn = 2;
-                if (!cur) {
-                    enter_app(launcher_app(g_menu_sel));      // any press length opens the highlighted app
-                } else if ((cur->flags & APP_HOLD_EXITS) && held_ms >= MODE_TOGGLE_MS) {
-                    enter_app(NULL);                   // back to the menu
-                } else if (cur->front_up) {
-                    cur->front_up(held_ms, is_long);
-                }
-            }
+        if (debounce(&side, side_level) && !side.committed) side_button_pressed();
+        if (debounce(&front, front_level)) {
+            if (!front.committed) front_button_pressed(); else front_button_released();
         }
-
-        // While still held, switch to blue once the long-press threshold is
-        // crossed so the user gets visual confirmation that releasing now
-        // will send Enter rather than toggle voice.
-        if (!a_committed && !a_long_latched) {
-            TickType_t held = xTaskGetTickCount() - a_press_start;
-            if (pdTICKS_TO_MS(held) >= g_press_cfg.long_press_ms) {
-                a_long_latched = true;
-                const app_t *cur = g_cur;
-                if (cur && (cur->flags & APP_USB_MIC) && !g_vad_display_enabled) lcd_status(COL_BLUE);
-            }
-        }
+        if (!front.committed) front_button_held();
 
         vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
     }

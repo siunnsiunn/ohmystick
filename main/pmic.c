@@ -30,41 +30,38 @@ esp_err_t i2c_bus_init(void)
 // =========================================================================
 uint8_t g_pmic_addr = 0;     // discovered at boot
 
-static esp_err_t pmic_write(uint8_t reg, uint8_t val)
-{
-    if (g_pmic_addr == 0) return ESP_ERR_NOT_FOUND;
-    i2c_master_dev_handle_t dev = NULL;
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = g_pmic_addr,
-        .scl_speed_hz    = 100000,        // conservative; this board dropped
-                                          // ACKs during earlier 400 kHz tests.
-    };
-    esp_err_t ret = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
-    if (ret != ESP_OK) return ret;
-    uint8_t buf[2] = { reg, val };
-    ret = i2c_master_transmit(dev, buf, sizeof(buf), 100);
-    i2c_master_bus_rm_device(dev);
-    return ret;
-}
-
 // Battery: M5PM1 VBAT = reg 0x22 (low byte) + 0x23 (low 4 bits), in mV; PWR_SRC
 // reg 0x04 is 0 when running from the USB 5V input (register map: m5stack/M5PM1).
 // The chip has no charge-complete flag, so "USB powered" stands in for charging.
+// One device handle, made on first use and kept: the chip is only talked to at 100 kHz
+// (400 kHz dropped ACKs on this board), so the speed is fixed here.
+static i2c_master_dev_handle_t pmic_dev(void)
+{
+    static i2c_master_dev_handle_t dev = NULL;
+    if (!dev && g_pmic_addr) {
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address  = g_pmic_addr,
+            .scl_speed_hz    = 100000,
+        };
+        if (i2c_master_bus_add_device(g_i2c_bus, &cfg, &dev) != ESP_OK) dev = NULL;
+    }
+    return dev;
+}
+
 static esp_err_t pmic_read_n(uint8_t reg, uint8_t *out, size_t n)
 {
-    if (g_pmic_addr == 0) return ESP_ERR_NOT_FOUND;
-    i2c_master_dev_handle_t dev = NULL;
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = g_pmic_addr,
-        .scl_speed_hz    = 100000,
-    };
-    esp_err_t ret = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
-    if (ret != ESP_OK) return ret;
-    ret = i2c_master_transmit_receive(dev, &reg, 1, out, n, 100);
-    i2c_master_bus_rm_device(dev);
-    return ret;
+    i2c_master_dev_handle_t d = pmic_dev();
+    return d ? i2c_master_transmit_receive(d, &reg, 1, out, n, 100) : ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t pmic_read(uint8_t reg, uint8_t *val) { return pmic_read_n(reg, val, 1); }
+
+static esp_err_t pmic_write(uint8_t reg, uint8_t val)
+{
+    i2c_master_dev_handle_t d = pmic_dev();
+    uint8_t buf[2] = { reg, val };
+    return d ? i2c_master_transmit(d, buf, sizeof(buf), 100) : ESP_ERR_NOT_FOUND;
 }
 
 // Linear map of cell voltage to percent (same curve as before: 100 % at 4100 mV).
@@ -181,22 +178,6 @@ void i2c_scan(void)
 }
 
 // PMIC reg helper for read-modify-write of single bits, M5Unified-style.
-static esp_err_t pmic_read(uint8_t reg, uint8_t *val)
-{
-    if (g_pmic_addr == 0) return ESP_ERR_NOT_FOUND;
-    i2c_master_dev_handle_t dev = NULL;
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = g_pmic_addr,
-        .scl_speed_hz    = 100000,
-    };
-    esp_err_t ret = i2c_master_bus_add_device(g_i2c_bus, &dev_cfg, &dev);
-    if (ret != ESP_OK) return ret;
-    ret = i2c_master_transmit_receive(dev, &reg, 1, val, 1, 100);
-    i2c_master_bus_rm_device(dev);
-    return ret;
-}
-
 static esp_err_t pmic_clear_bit(uint8_t reg, uint8_t bit_mask)
 {
     uint8_t v = 0;
