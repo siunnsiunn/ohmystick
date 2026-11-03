@@ -100,7 +100,7 @@ The stick is one composite USB device: the host sees a 16 kHz microphone and a H
 
 Lying flat with the screen up mutes the mic through the IMU. Upstream's [web config page](https://openbrt.github.io/voxstick/config.html) changes flat auto-mute and the tap/hold shortcuts. This firmware keeps the same USB IDs and config protocol, so it should work, but I have not tested the page against it.
 
-**Windows dictation**: on a Windows PC too slow for local Whisper (or Windows 10, whose Win+H has no Traditional Chinese), use [`tools/winvoice`](tools/winvoice/README.md): in USB MIC mode the front button records, Azure Speech transcribes, and the text is pasted.
+**Windows dictation**: on a Windows PC too slow for local Whisper (or Windows 10, whose Win+H has no Traditional Chinese), use [`tools/winvoice`](tools/winvoice/README.md): in USB MIC mode the front button records, Azure Speech or Groq Whisper transcribes, and the text is pasted.
 
 ## Documents
 
@@ -109,7 +109,7 @@ Lying flat with the screen up mutes the mic through the IMU. Upstream's [web con
 | [`docs/BT-MIC.md`](docs/BT-MIC.md) | BLE recording protocol, Mac helper, environment variables, pitfalls |
 | [`docs/DIAG.md`](docs/DIAG.md) | Reading the status page and reset codes, font generation |
 | [`docs/INBOX.md`](docs/INBOX.md) | Voice-note inbox and the agent interface |
-| [`tools/winvoice/README.md`](tools/winvoice/README.md) | Windows dictation helper (Azure Speech, USB MIC mode; in Chinese) |
+| [`tools/winvoice/README.md`](tools/winvoice/README.md) | Windows dictation helper (Azure Speech / Groq Whisper, USB MIC mode; in Chinese) |
 | [`docs/NOTE-CLOUD.md`](docs/NOTE-CLOUD.md) | Research on cloud inboxes and the optional synced-folder copy |
 | [`SESSION-NOTES.md`](SESSION-NOTES.md) | Upstream bring-up log (PMIC, ES8311 and other rough edges) |
 

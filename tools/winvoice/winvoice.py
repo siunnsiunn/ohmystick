@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """winvoice: press Ctrl+F12 (the StickS3 front button in USB MIC mode), talk,
-press it again; the recording goes to Azure Speech and the text is pasted at
-the cursor.
+press it again; the recording goes to a cloud speech service (Azure Speech or
+Groq Whisper) and the text is pasted at the cursor.
 
 Windows 10/11 x64, Python 3.10+, one extra package: `pip install sounddevice`.
-No Speech SDK and no Visual C++ runtime: Azure is called over plain HTTPS.
+No Speech SDK and no Visual C++ runtime: everything is plain HTTPS.
 
-Two Azure back ends (config `backend`):
+Back ends (config `backend`):
   short  REST API for short audio. Works on the free F0 tier, max 60 s per
          recording, no phrase list.
   fast   Fast transcription API. Needs a paid S0 resource, takes a phrase list
          (vocab.txt) so drug names and abbreviations come out right.
+  groq   Groq's Whisper large-v3. Free tier is about 8 audio hours a day; the
+         vocabulary goes in as a Whisper prompt. Whisper may answer in
+         Simplified Chinese, so install opencc-python-reimplemented and
+         winvoice converts the result to Traditional.
 
 Usage:
   py winvoice.py                 run (Ctrl+F12 toggles, Ctrl+Shift+F12 quits)
@@ -52,6 +56,10 @@ DEFAULTS = {
     "key": "",
     "region": "",
     "endpoint": "",
+    "groq_key": "",
+    "groq_model": "whisper-large-v3",
+    "groq_url": "https://api.groq.com/openai/v1/audio/transcriptions",
+    "opencc": "s2tw",
     "backend": "short",
     "language": "zh-TW",
     "microphone": "StickS3",
@@ -78,6 +86,10 @@ class Config:
         self.key = os.environ.get("AZURE_SPEECH_KEY") or s.get("key").strip()
         self.region = s.get("region").strip()
         self.endpoint = s.get("endpoint").strip().rstrip("/")
+        self.groq_key = os.environ.get("GROQ_API_KEY") or s.get("groq_key").strip()
+        self.groq_model = s.get("groq_model").strip()
+        self.groq_url = s.get("groq_url").strip()
+        self.opencc = s.get("opencc").strip()
         self.backend = s.get("backend").strip().lower()
         self.language = s.get("language").strip()
         self.microphone = s.get("microphone").strip()
@@ -97,12 +109,16 @@ class Config:
 
     def validate(self) -> list[str]:
         errs = []
-        if not self.key:
-            errs.append("key is empty (set it in winvoice.ini or AZURE_SPEECH_KEY)")
-        if not self.region and not self.endpoint:
-            errs.append("set region (e.g. eastasia) or endpoint")
-        if self.backend not in ("short", "fast"):
-            errs.append("backend must be short or fast")
+        if self.backend not in ("short", "fast", "groq"):
+            errs.append("backend must be short, fast or groq")
+        elif self.backend == "groq":
+            if not self.groq_key:
+                errs.append("groq_key is empty (set it in winvoice.ini or GROQ_API_KEY)")
+        else:
+            if not self.key:
+                errs.append("key is empty (set it in winvoice.ini or AZURE_SPEECH_KEY)")
+            if not self.region and not self.endpoint:
+                errs.append("set region (e.g. eastasia) or endpoint")
         if self.output not in ("paste", "type"):
             errs.append("output must be paste or type")
         return errs
@@ -233,23 +249,24 @@ def transcribe_short(wav: bytes, cfg: Config) -> str:
     raise TranscribeError(f"RecognitionStatus={status}")
 
 
+def multipart(fields: list[tuple[str, str]], file_field: str, wav: bytes) -> tuple[bytes, str]:
+    boundary = "----winvoice" + uuid.uuid4().hex
+    parts = []
+    for name, value in fields:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        parts.append(value.encode("utf-8") + b"\r\n")
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; '
+                 'filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode())
+    parts.append(wav)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
 def fast_body(wav: bytes, cfg: Config, phrases: list[str]) -> tuple[bytes, str]:
     definition: dict = {"locales": [cfg.language], "profanityFilterMode": "None"}
     if phrases:
         definition["phraseList"] = {"phrases": phrases}
-    boundary = "----winvoice" + uuid.uuid4().hex
-    parts = [
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="definition"\r\n'
-        "Content-Type: application/json\r\n\r\n".encode(),
-        json.dumps(definition, ensure_ascii=False).encode("utf-8"),
-        f"\r\n--{boundary}\r\n"
-        'Content-Disposition: form-data; name="audio"; filename="audio.wav"\r\n'
-        "Content-Type: audio/wav\r\n\r\n".encode(),
-        wav,
-        f"\r\n--{boundary}--\r\n".encode(),
-    ]
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+    return multipart([("definition", json.dumps(definition, ensure_ascii=False))], "audio", wav)
 
 
 def transcribe_fast(wav: bytes, cfg: Config, phrases: list[str]) -> str:
@@ -264,9 +281,79 @@ def transcribe_fast(wav: bytes, cfg: Config, phrases: list[str]) -> str:
     return "".join(t.strip() for t in texts).strip()
 
 
+def whisper_prompt(phrases: list[str]) -> str:
+    """Whisper continues in the style of its prompt, so a Traditional Chinese
+    sentence nudges it away from Simplified output. The vocabulary is joined
+    into one sentence, as btmic does; Whisper only reads ~224 tokens of it."""
+    prompt = "以下是繁體中文的口述內容。"
+    if phrases:
+        prompt += "，".join(phrases) + "。"
+    return prompt[:150]
+
+
+def whisper_language(language: str) -> str:
+    # Whisper wants ISO-639-1: zh-TW -> zh
+    return language.split("-")[0].lower()
+
+
+def transcribe_groq(wav: bytes, cfg: Config, phrases: list[str]) -> str:
+    body, ctype = multipart([
+        ("model", cfg.groq_model),
+        ("language", whisper_language(cfg.language)),
+        ("prompt", whisper_prompt(phrases)),
+        ("response_format", "json"),
+        ("temperature", "0"),
+    ], "file", wav)
+    req = urllib.request.Request(cfg.groq_url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {cfg.groq_key}",
+        "Content-Type": ctype,
+        "Accept": "application/json",
+        # Groq sits behind Cloudflare, which may refuse urllib's default agent.
+        "User-Agent": "winvoice/1.0",
+    })
+    j = _http(req, cfg.timeout)
+    return (j.get("text") or "").strip()
+
+
+# What Whisper says over silence or noise: subtitle credits from its training data.
+WHISPER_JUNK = ("字幕由", "Amara", "點贊", "点赞", "請訂閱", "请订阅", "訂閱我", "订阅我",
+                "謝謝觀看", "谢谢观看", "感謝觀看", "感谢观看", "感謝收看", "感谢收看",
+                "明鏡與點點", "明镜与点点")
+
+
+def drop_whisper_junk(text: str) -> str:
+    if len(text) <= 40 and any(j in text for j in WHISPER_JUNK):
+        log.info("dropped a likely Whisper hallucination (%d chars)", len(text))
+        return ""
+    return text
+
+
+_converter = None
+
+
+def to_traditional(text: str, mode: str) -> str:
+    """Simplified -> Traditional with OpenCC (pip install
+    opencc-python-reimplemented). s2tw only swaps characters to Taiwan's
+    standard forms; s2twp also rewrites vocabulary (软件 -> 軟體)."""
+    global _converter
+    if not mode or not text:
+        return text
+    if _converter is None:
+        try:
+            from opencc import OpenCC
+            _converter = OpenCC(mode)
+        except Exception as e:  # not installed, or unknown mode
+            log.warning("OpenCC unavailable (%s); output is not converted", e)
+            _converter = False
+    return _converter.convert(text) if _converter else text
+
+
 def transcribe(wav: bytes, cfg: Config, phrases: list[str]) -> str:
     if cfg.backend == "fast":
         return transcribe_fast(wav, cfg, phrases)
+    if cfg.backend == "groq":
+        # Azure already answers in zh-TW; only Whisper needs the conversion.
+        return to_traditional(drop_whisper_junk(transcribe_groq(wav, cfg, phrases)), cfg.opencc)
     return transcribe_short(wav, cfg)
 
 
@@ -569,7 +656,7 @@ def setup_logging(console: bool) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Ctrl+F12 dictation via Azure Speech")
+    ap = argparse.ArgumentParser(description="Ctrl+F12 dictation via Azure Speech or Groq")
     ap.add_argument("--config", help="path to winvoice.ini")
     ap.add_argument("--list-devices", action="store_true", help="list input devices")
     ap.add_argument("--test", action="store_true", help="record 5 s, transcribe, print")
@@ -593,7 +680,7 @@ def main(argv=None) -> int:
         return 2
     phrases = load_phrases(cfg.vocab_file)
     if phrases and cfg.backend == "short":
-        log.info("vocab.txt is ignored by backend=short (only fast uses a phrase list)")
+        log.info("vocab.txt is ignored by backend=short (fast and groq use it)")
 
     if args.file:
         with open(args.file, "rb") as f:

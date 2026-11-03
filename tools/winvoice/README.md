@@ -1,12 +1,12 @@
-# winvoice：Windows 上用 Stick 聽寫（Azure 語音）
+# winvoice：Windows 上用 Stick 聽寫（Azure 語音／Groq Whisper）
 
 給沒辦法跑本機 Whisper 的 Windows 電腦用，例如診所那台 i3、4 GB 的 Windows 10。
-按一下 Stick 前鍵開始錄音，再按一下停止；錄音送到 Azure 語音服務轉成繁體中文，
+按一下 Stick 前鍵開始錄音，再按一下停止；錄音送到雲端（Azure 語音或 Groq）轉成繁體中文，
 1～2 秒後貼到游標處。
 
 ```
 前鍵（Ctrl+F12）─▶ 嗶（高音），開始錄音
-前鍵（Ctrl+F12）─▶ 嗶（低音），停止 ─▶ HTTPS 送 Azure ─▶ 文字貼到游標處
+前鍵（Ctrl+F12）─▶ 嗶（低音），停止 ─▶ HTTPS 送 Azure／Groq ─▶ 文字貼到游標處
 ```
 
 - Stick 用原本的 **USB MIC**（USB 麥克風）模式，前鍵單擊預設就是 `Ctrl+F12`，韌體不用改。
@@ -21,13 +21,25 @@
 |---|---|---|---|---|
 | `short`（預設） | Azure 短音訊 REST API | 60 秒 | 不支援 | 免費方案 F0 每月 5 小時 |
 | `fast` | Azure 快速轉寫 API | 本程式設 `max_seconds` | 支援 `vocab.txt` | 要付費方案 S0，依秒計費；F0 不提供 |
+| `groq` | Groq 的 Whisper large-v3 | 本程式設 `max_seconds` | `vocab.txt` 當提示詞 | 免費方案每天約 28,800 秒（8 小時）、每天 2,000 次；不足 10 秒以 10 秒計 |
 
-先用 `short` 加免費方案試；藥名、縮寫常錯，再換 S0 加 `fast` 和詞彙表。
-價格以 [Azure 定價頁](https://azure.microsoft.com/pricing/details/cognitive-services/speech-services/) 為準。
+- `short`：Azure 原生台灣繁中，免費額度少。
+- `groq`：免費額度最多，有提示詞；但它是原版 Whisper（不是 Breeze），偶爾輸出簡體，
+  winvoice 會用 OpenCC 轉回繁體；靜音時 Whisper 可能「聽」出「字幕由 Amara.org 提供」之類的字，
+  winvoice 會丟掉這類短句。
+- 兩個都申請，同一段話用 `--test` 各跑一次，比較哪個準。
+
+額度與價格常變動，以 [Azure 定價頁](https://azure.microsoft.com/pricing/details/cognitive-services/speech-services/)
+和 [Groq rate limits](https://console.groq.com/docs/rate-limits) 為準。
 
 ## 安裝
 
-### 1. 申請 Azure 語音服務
+### 1. 申請 API 金鑰（Azure、Groq 擇一或都申請）
+
+**Groq**：到 [console.groq.com](https://console.groq.com) 註冊，在 API Keys 建立一把金鑰（`gsk_` 開頭），
+填進 `groq_key`，`backend = groq`。
+
+**Azure**：
 
 1. 到 [Azure 入口網站](https://portal.azure.com) 建立「語音服務（Speech service）」資源。
 2. 區域選近的，例如 `East Asia`（香港，代號 `eastasia`）；定價層選 `Free F0`
@@ -41,15 +53,17 @@
 3. 開「命令提示字元」：
 
 ```bat
-py -m pip install sounddevice
+py -m pip install sounddevice opencc-python-reimplemented
 ```
+
+（`opencc-python-reimplemented` 是純 Python 的簡轉繁，只有 `groq` 用得到。）
 
 ### 3. 設定
 
 把 `tools/winvoice` 資料夾複製到電腦上（例如 `C:\winvoice`），然後：
 
-1. 複製 `winvoice.example.ini` 為 `winvoice.ini`，填入 `key` 和 `region`。
-2. 用 `fast` 時，複製 `vocab.example.txt` 為 `vocab.txt` 再改成自己的詞。
+1. 複製 `winvoice.example.ini` 為 `winvoice.ini`，填入金鑰（Azure：`key`、`region`；Groq：`groq_key`）並設定 `backend`。
+2. 用 `fast` 或 `groq` 時，複製 `vocab.example.txt` 為 `vocab.txt` 再改成自己的詞。
 3. Stick 插上 USB、切到 **USB MIC**，**拿直**（平放會自動靜音）。
 4. 確認抓得到 Stick 的麥克風，並試錄 5 秒：
 
@@ -95,9 +109,11 @@ powershell -ExecutionPolicy Bypass -File install-startup.ps1
 
 | 記錄檔內容 | 原因 |
 |---|---|
-| `HTTP 401` | 金鑰錯，或金鑰和 `region` 不是同一個資源 |
+| `HTTP 401` | 金鑰錯，或（Azure）金鑰和 `region` 不是同一個資源 |
 | `HTTP 403` / `429` | 免費額度用完或請求太頻繁 |
-| `network: ...` | 沒網路、防火牆或 Proxy 擋住 `*.speech.microsoft.com` |
+| `network: ...` | 沒網路、防火牆或 Proxy 擋住 `*.speech.microsoft.com` 或 `api.groq.com` |
+| `OpenCC unavailable` | 沒裝 `opencc-python-reimplemented`，Groq 的結果不會轉繁體 |
+| `dropped a likely Whisper hallucination` | Whisper 在幾乎沒聲音時編出的字幕句，已丟棄 |
 | `skipped: ... peak ...` | 太短或幾乎沒聲音：Stick 平放靜音了？麥克風選錯？ |
 | `no input device matches` | 找不到 Stick 的麥克風，改用了預設麥克風 |
 | `Ctrl+F12 is taken` | 其他程式佔了熱鍵 |
@@ -107,5 +123,6 @@ powershell -ExecutionPolicy Bypass -File install-startup.ps1
 
 ## 隱私
 
-錄音會經 HTTPS 送到你選的 Azure 區域辨識，不留在本機。診所使用前，請依院所規範確認
-病患語音送雲端是否可以接受；微軟對語音資料的處理方式請以 Azure 官方文件為準。
+錄音會經 HTTPS 送到雲端辨識，不留在本機：Azure 送到你選的區域，Groq 送到 Groq 的伺服器（美國公司）。
+診所使用前，請依院所規範確認病患語音送雲端是否可以接受；各家如何保存、使用語音資料，
+請以 Azure 和 Groq 的官方條款為準（這裡沒有替你查證）。
