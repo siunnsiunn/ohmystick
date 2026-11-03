@@ -33,3 +33,8 @@ upstream/
 
 # Mac helper build output
 tools/btmic/out/
+
+# Windows helper: the real config holds the Azure key
+tools/winvoice/winvoice.ini
+tools/winvoice/vocab.txt
+tools/winvoice/__pycache__/

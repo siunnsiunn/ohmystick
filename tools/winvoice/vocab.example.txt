@@ -1,0 +1,10 @@
+# 複製成 vocab.txt。一行一個詞或短語，只有 backend = fast 會用。
+# 放常講但容易被聽錯的：藥名、檢驗縮寫（照你要的大小寫寫）、固定說法。
+CBC
+BUN
+creatinine
+SDMA
+ALT
+cPLI
+Meloxicam
+胰臟炎
