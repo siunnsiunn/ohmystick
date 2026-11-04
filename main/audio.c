@@ -42,6 +42,21 @@ esp_err_t i2s_rx_init(void)
 // =========================================================================
 // ES8311 codec — register init via esp_codec_dev
 // =========================================================================
+// The register set the microphone needs (see the notes above). Also used to put the codec
+// back after the speaker has borrowed it.
+void codec_mic_regs(void)
+{
+    esp_codec_dev_write_reg(g_codec_dev, 0x00, 0x80);
+    esp_codec_dev_write_reg(g_codec_dev, 0x01, 0xBA);
+    esp_codec_dev_write_reg(g_codec_dev, 0x02, 0x18);
+    esp_codec_dev_write_reg(g_codec_dev, 0x0D, 0x01);
+    esp_codec_dev_write_reg(g_codec_dev, 0x0E, 0x02);
+    esp_codec_dev_write_reg(g_codec_dev, 0x14, 0x10);
+    esp_codec_dev_write_reg(g_codec_dev, 0x16, 0x07);
+    esp_codec_dev_write_reg(g_codec_dev, 0x17, 0xFF);
+    esp_codec_dev_write_reg(g_codec_dev, 0x1C, 0x6A);
+}
+
 esp_err_t codec_init(void)
 {
     audio_codec_i2c_cfg_t i2c_cfg = {
@@ -114,15 +129,7 @@ esp_err_t codec_init(void)
     //   0x16 = 0x07  ADC_REG16, mic PGA gain step (7 = +42 dB max).
     //   0x17 = 0xFF  ADC_VOLUME, max digital gain
     //   0x1C = 0x6A  ADC, equalizer bypass + DC offset cancel
-    esp_codec_dev_write_reg(g_codec_dev, 0x00, 0x80);
-    esp_codec_dev_write_reg(g_codec_dev, 0x01, 0xBA);
-    esp_codec_dev_write_reg(g_codec_dev, 0x02, 0x18);
-    esp_codec_dev_write_reg(g_codec_dev, 0x0D, 0x01);
-    esp_codec_dev_write_reg(g_codec_dev, 0x0E, 0x02);
-    esp_codec_dev_write_reg(g_codec_dev, 0x14, 0x10);
-    esp_codec_dev_write_reg(g_codec_dev, 0x16, 0x07);
-    esp_codec_dev_write_reg(g_codec_dev, 0x17, 0xFF);
-    esp_codec_dev_write_reg(g_codec_dev, 0x1C, 0x6A);
+    codec_mic_regs();
 
     g_codec_ready = true;
     return ESP_OK;

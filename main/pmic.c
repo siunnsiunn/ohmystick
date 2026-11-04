@@ -255,6 +255,12 @@ static void pmic_dump_regs(const char *label)
 //   0x11  GPIO output level   bit n: 1 = high, 0 = low
 //   0x13  GPIO mode           bit n: 1 = open-drain, 0 = push-pull
 //   0x16  GPIO function       bit n: 1 = alt, 0 = GPIO
+// The speaker amplifier enable is M5PM1 GPIO3 (set low in pmic_init: muted).
+void pmic_speaker(bool on)
+{
+    if (on) pmic_set_bit(0x11, 1 << 3); else pmic_clear_bit(0x11, 1 << 3);
+}
+
 esp_err_t pmic_init(void)
 {
     ESP_RETURN_ON_ERROR(pmic_probe(), TAG, "pmic probe");

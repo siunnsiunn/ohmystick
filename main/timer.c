@@ -86,11 +86,12 @@ static void draw_hints(void)
 {
     const char *a = "", *b = "";
     switch (s_state) {
-        case T_IDLE:  a = "前鍵 開始";  b = "側鍵 換時間"; break;
-        case T_RUN:   a = "前鍵 暫停";  b = "側鍵 取消";   break;
-        case T_PAUSE: a = "前鍵 繼續";  b = "側鍵 取消";   break;
-        case T_DONE:  a = "按任一鍵";   b = "回到起點";     break;
+        case T_IDLE:  a = "前鍵開始 側鍵換時間"; break;
+        case T_RUN:   a = "前鍵暫停 側鍵取消";   break;
+        case T_PAUSE: a = "前鍵繼續 側鍵取消";   break;
+        case T_DONE:  a = "按任一鍵重新開始";     break;
     }
+    b = "按住前鍵 回選單";
     lcd_fill_rect(0, 206, LCD_W, 236, COL_BLACK);
     zh_center(208, a, COL_LIGHT_GRAY, 1);
     zh_center(222, b, COL_LIGHT_GRAY, 1);
@@ -124,7 +125,7 @@ static uint32_t timer_tick(bool first)
     if (first) { frame_reset(); s_flips_seen = g_imu_flips; }
     if (g_imu_flips != s_flips_seen) { s_flips_seen = g_imu_flips; timer_flip(); }
     uint32_t left = remaining_ms();
-    if (s_state == T_RUN && left == 0) { s_state = T_DONE; s_left_ms = 0; s_dirty = true; }
+    if (s_state == T_RUN && left == 0) { s_state = T_DONE; s_left_ms = 0; s_dirty = true; beep_play(3); }
     uint32_t total = preset_ms();
     int n_top = (int)(((uint64_t)(s_state == T_DONE ? 0 : left) * HG_HALF + total / 2) / total);
     if (n_top > HG_HALF) n_top = HG_HALF;

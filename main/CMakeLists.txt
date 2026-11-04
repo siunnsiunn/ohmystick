@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.c" "lcd.c" "statusbar.c" "screens.c" "display.c" "download.c" "pmic.c" "audio.c" "imu.c"
-         "usb_audio.c" "buttons.c" "apps.c" "timer.c" "diag.c" "monitor.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
+         "usb_audio.c" "buttons.c" "apps.c" "timer.c" "beep.c" "diag.c" "monitor.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
          "ble_presenter.c" "esp_hid_gap.c" "btmic.c" "inbox.c" "zh_font.c"
     PRIV_REQUIRES driver
                   esp_system
