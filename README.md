@@ -107,6 +107,7 @@ Stick 是一個複合 USB 裝置，電腦同時看到一支 16 kHz 麥克風和�
 | [`docs/BT-MIC.md`](docs/BT-MIC.md) | 藍牙錄音協定、Mac 端程式、環境變數、踩過的坑 |
 | [`docs/DIAG.md`](docs/DIAG.md) | 狀態頁與重開機代碼怎麼讀、字型產生規則 |
 | [`docs/INBOX.md`](docs/INBOX.md) | 語音筆記收件夾與 agent 取件介面 |
+| [`docs/WIFI-PLAN.md`](docs/WIFI-PLAN.md) | Wi-Fi 聽寫計畫（草案，經 Tailscale 送到 Windows 電腦） |
 | [`docs/NOTE-CLOUD.md`](docs/NOTE-CLOUD.md) | 筆記上雲的研究與選用的雲端資料夾複本 |
 | [`SESSION-NOTES.md`](SESSION-NOTES.md) | 上游 voxstick 的開發紀錄（電源晶片、ES8311 等問題） |
 
