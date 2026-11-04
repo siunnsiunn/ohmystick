@@ -163,13 +163,29 @@ def find_input_device(name: str):
     (= system default). MME devices come first in sounddevice's list and
     resample to 16 kHz for us, so the first match is the one we want."""
     import sounddevice as sd
+    inputs = [(i, d) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+    if not inputs:
+        log.error("Windows reports no microphone at all (run --list-devices for what to check)")
+        return None
     if not name:
         return None
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0 and name.lower() in d["name"].lower():
+    for i, d in inputs:
+        if name.lower() in d["name"].lower():
             return i
     log.warning("no input device matches %r, using the default microphone", name)
     return None
+
+
+NO_MIC_HELP = """Windows reports no microphone at all. Check:
+  1. The stick is plugged in with a data cable (a charge-only cable shows no device)
+     and is on the USB MIC screen; Windows should chime when it connects.
+  2. Settings > System > Sound > Input lists "StickS3-Mic"; if not, look in
+     Device Manager under "Audio inputs and outputs" and "Sound, video and game controllers".
+  3. Settings > Privacy > Microphone: "Allow apps to access your microphone" and
+     "Allow desktop apps to access your microphone" are On.
+  4. Control Panel > Sound > Recording: right-click, "Show Disabled Devices",
+     enable StickS3-Mic and "Set as Default Device".
+Then run: py winvoice.py --list-devices"""
 
 
 class Recorder:
@@ -687,10 +703,14 @@ def main(argv=None) -> int:
 
     if args.list_devices:
         import sounddevice as sd
+        found = False
         for i, d in enumerate(sd.query_devices()):
             if d["max_input_channels"] > 0:
+                found = True
                 api = sd.query_hostapis(d["hostapi"])["name"]
                 print(f"{i:3d}  {d['name']}  [{api}]")
+        if not found:
+            print(NO_MIC_HELP)
         return 0
 
     cfg = Config(args.config)
@@ -710,8 +730,13 @@ def main(argv=None) -> int:
 
     if args.test:
         rec = Recorder(find_input_device(cfg.microphone))
+        try:
+            rec.start()
+        except Exception as e:  # no microphone, device busy or blocked by privacy settings
+            log.error("cannot open microphone: %s", e)
+            print(NO_MIC_HELP)
+            return 1
         print("Recording 5 s, talk now...")
-        rec.start()
         time.sleep(5)
         pcm = rec.stop()
         print(f"peak {pcm_peak(pcm)} (below {cfg.silence_peak} counts as silence)")
