@@ -54,6 +54,7 @@
 #include "vox_config.h"
 #include "ble_presenter.h"
 #include "btmic.h"
+#include "wifimic.h"
 #include "launcher.h"
 #include "zh_font.h"
 #include "ui.h"
@@ -245,6 +246,7 @@ esp_err_t pmic_init(void);
 void lcd_draw_menu(int sel, int prev);
 void lcd_clear_locked(void);
 void lcd_draw_btrec(int ui, bool note);
+void lcd_draw_wifimic(int ui);
 void lcd_draw_presenter(void);
 extern int           g_batt_pct;
 extern volatile TickType_t g_batt_good_tick;

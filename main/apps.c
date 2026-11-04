@@ -131,6 +131,41 @@ static void voice_front_up(uint32_t held, bool is_long) { (void)held; (void)is_l
 static void voice_side_down(void)        { if (!btmic_recording()) enter_app(NULL); }
 
 
+// ---- WIFI: WHISPER over Wi-Fi + Tailscale (wifimic.c) -----------------------------
+static void icon_wifi(int x, int y, uint16_t fg, uint16_t bg)       // three arcs over a dot
+{
+    (void)bg;
+    for (int k = 0; k < 3; k++) {
+        int r = 6 + k * 6, cx = x + 14, cy = y + 24;
+        lcd_draw_thick_line(cx - r, cy - r, cx, cy - r - r / 2, 2, fg);
+        lcd_draw_thick_line(cx, cy - r - r / 2, cx + r, cy - r, 2, fg);
+    }
+    lcd_fill_rect(x + 12, y + 22, x + 17, y + 27, fg);
+}
+static uint32_t wifi_tick(bool first)
+{
+    static int last_key = -1;
+    int key = (int)wifimic_ui_state();
+    if (first || key != last_key) {
+        last_key = key;
+        lcd_draw_wifimic(key);
+    }
+    return 100;
+}
+static int  wifi_activity(void)          { return (int)wifimic_ui_state(); }
+static void wifi_enter(void)             { wifimic_enter(); }
+static void wifi_front_down(void)        { wifimic_start(); }
+static void wifi_front_up(uint32_t held, bool is_long)
+{
+    (void)is_long;
+    if (wifimic_recording()) { wifimic_stop(); return; }
+    wifimic_ui_t ui = wifimic_ui_state();
+    // No link (or a fresh stick): holding the front button for 3 s opens the setup hotspot.
+    if (held >= 3000 && ui != WIFIMIC_UI_READY && ui != WIFIMIC_UI_BUSY && ui != WIFIMIC_UI_SETUP)
+        wifimic_request_setup();
+}
+static void wifi_side_down(void)         { if (!wifimic_recording()) enter_app(NULL); }
+
 static const app_t app_usb_mic = {
     .name = "USB MIC", .name_zh = "USB麥克風", .desc_zh = "當電腦的麥克風", .color = COL_CYAN, .icon = icon_mic,
     .flags = APP_NO_SLEEP | APP_USB_MIC | APP_HOLD_EXITS,
@@ -160,6 +195,13 @@ static const app_t app_diag = {
     .tick = diag_tick, .front_down = diag_front_down, .front_up = diag_front_up,
 };
 
-static const app_t *const k_apps[] = { &app_usb_mic, &app_whisper, &app_note, &app_slide, &app_timer, &app_diag };
+static const app_t app_wifi = {
+    .name = "WIFI", .name_zh = "Wi-Fi聽寫", .desc_zh = "經Wi-Fi貼到電腦", .color = COL_GREEN, .icon = icon_wifi,
+    .flags = APP_NO_SLEEP,
+    .enter = wifi_enter, .tick = wifi_tick, .activity_key = wifi_activity,
+    .front_down = wifi_front_down, .front_up = wifi_front_up, .side_down = wifi_side_down,
+};
+
+static const app_t *const k_apps[] = { &app_usb_mic, &app_whisper, &app_wifi, &app_note, &app_slide, &app_timer, &app_diag };
 const app_t *launcher_app(int i)  { return k_apps[i]; }
 int          launcher_count(void) { return (int)(sizeof(k_apps) / sizeof(k_apps[0])); }

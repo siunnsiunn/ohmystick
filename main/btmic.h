@@ -22,6 +22,10 @@ typedef enum {
 // read, or a negative value on error.
 typedef int (*btmic_read_fn)(int16_t *dst, int n);
 
+// IMA ADPCM encoder shared with the Wi-Fi sender (wifimic.c); same state for both nibbles of a byte.
+typedef struct { int pred; int idx; } vox_adpcm_t;
+uint8_t vox_adpcm_encode(int16_t sample, vox_adpcm_t *s);
+
 // Starts the sender task. Call once after the codec is ready.
 void btmic_init(btmic_read_fn reader);
 

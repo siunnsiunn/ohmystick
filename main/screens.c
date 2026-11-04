@@ -121,6 +121,44 @@ void lcd_draw_btrec(int ui, bool note)
     xSemaphoreGive(g_pres_lcd_mu);
 }
 
+void lcd_draw_wifimic(int ui)
+{
+    static const struct { const char *word; uint16_t col; const char *hint; } k[] = {
+        [WIFIMIC_UI_OFF]     = { "啟動中", COL_ORANGE, "" },
+        [WIFIMIC_UI_SETUP]   = { "設定",   COL_YELLOW, "手機連上後開 192.168.4.1" },
+        [WIFIMIC_UI_SAVED]   = { "已儲存", COL_GREEN,  "重新開機中" },
+        [WIFIMIC_UI_WIFI]    = { "連線中", COL_ORANGE, "Wi-Fi" },
+        [WIFIMIC_UI_TAILNET] = { "連線中", COL_ORANGE, "Tailscale" },
+        [WIFIMIC_UI_PEER]    = { "未連線", COL_ORANGE, "請開啟電腦的 winvoice" },
+        [WIFIMIC_UI_READY]   = { "可錄音", COL_CYAN,   "按住前鍵說話" },
+        [WIFIMIC_UI_REC]     = { "錄音中", COL_RED,    "放開後轉成文字" },
+        [WIFIMIC_UI_BUSY]    = { "轉寫中", COL_YELLOW, "請稍候" },
+        [WIFIMIC_UI_DONE]    = { "完成",   COL_GREEN,  "" },
+        [WIFIMIC_UI_ERR]     = { "失敗",   COL_RED,    "沒聽到內容 請再說一次" },
+    };
+    if (!g_lcd) return;
+    if (ui < 0 || ui >= (int)(sizeof(k) / sizeof(k[0]))) ui = 0;
+    char a[40], b[40];
+    wifimic_detail(a, sizeof(a), b, sizeof(b));
+    xSemaphoreTake(g_pres_lcd_mu, portMAX_DELAY);
+    lcd_clear(COL_BLACK);
+    zh_center(34, "Wi-Fi聽寫", COL_LIGHT_GRAY, 2);
+    zh_center(ui == WIFIMIC_UI_SETUP ? 66 : (LCD_H - 36) / 2, k[ui].word, k[ui].col, 3);
+    if (ui == WIFIMIC_UI_SETUP) {                   // hotspot name and password, large enough to type
+        zh_center(116, a, COL_WHITE, 1);
+        zh_center(136, b, COL_WHITE, 2);
+        zh_center(170, "手機連這個 Wi-Fi", COL_LIGHT_GRAY, 1);
+    } else {
+        zh_center(160, a, COL_LIGHT_GRAY, 1);
+        zh_center(176, b, COL_LIGHT_GRAY, 1);
+    }
+    zh_center(196, k[ui].hint, COL_LIGHT_GRAY, 1);
+    if (ui == WIFIMIC_UI_WIFI || ui == WIFIMIC_UI_TAILNET || ui == WIFIMIC_UI_PEER)
+        zh_center(214, "長按前鍵3秒 重新設定", COL_LIGHT_GRAY, 1);
+    statusbar_paint_if_dirty();
+    xSemaphoreGive(g_pres_lcd_mu);
+}
+
 void lcd_draw_presenter(void)
 {
     if (!g_lcd) return;

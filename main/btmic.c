@@ -82,9 +82,7 @@ static const int16_t k_step[89] = {
 };
 static const int8_t k_idx[16] = {-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8};
 
-typedef struct { int pred; int idx; } adpcm_t;
-
-static uint8_t adpcm_encode(int16_t sample, adpcm_t *s)
+uint8_t vox_adpcm_encode(int16_t sample, vox_adpcm_t *s)
 {
     int diff = sample - s->pred;
     int code = 0;
@@ -283,7 +281,7 @@ static void record_session(void)
     uint8_t frame[FRAME_LEN];
     bool off = s_rec_offline;
     uint8_t flags = off ? FLAG_OFFLINE : 0;
-    adpcm_t st = {0, 0};
+    vox_adpcm_t st = {0, 0};
     uint16_t seq = 0;
     int dropped = 0;
 
@@ -305,8 +303,8 @@ static void record_session(void)
         int pred0 = st.pred, idx0 = st.idx;
         uint8_t *data = frame + HEADER_LEN;
         for (int i = 0; i < SAMPLES_PER_FRAME / 2; i++) {
-            uint8_t lo = adpcm_encode(pcm[2 * i], &st);
-            uint8_t hi = adpcm_encode(pcm[2 * i + 1], &st);
+            uint8_t lo = vox_adpcm_encode(pcm[2 * i], &st);
+            uint8_t hi = vox_adpcm_encode(pcm[2 * i + 1], &st);
             data[i] = lo | (hi << 4);
         }
         if (off) {
