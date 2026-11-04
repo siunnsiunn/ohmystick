@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "main.c" "lcd.c" "statusbar.c" "screens.c" "display.c" "download.c" "pmic.c" "audio.c" "imu.c"
          "usb_audio.c" "buttons.c" "apps.c" "timer.c" "beep.c" "diag.c" "monitor.c" "usb_descriptors.c" "usb_recovery.c" "vox_config.c"
-         "ble_presenter.c" "esp_hid_gap.c" "btmic.c" "inbox.c" "zh_font.c"
+         "ble_presenter.c" "esp_hid_gap.c" "btmic.c" "inbox.c" "zh_font.c" "wifimic.c"
     PRIV_REQUIRES driver
                   esp_system
                   esp_driver_i2c
@@ -14,6 +14,11 @@ idf_component_register(
                   nvs_flash
                   esp_hid
                   bt
+                  esp_wifi
+                  esp_netif
+                  esp_event
+                  esp_http_server
+                  microlink
     INCLUDE_DIRS "."
 )
 

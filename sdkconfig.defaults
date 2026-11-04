@@ -50,3 +50,23 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# --- Wi-Fi + Tailscale (WIFI app, MicroLink in third_party/microlink) -----------------
+# Settings from MicroLink's basic_connect example that the tunnel needs: the Noise
+# handshake uses ChaCha20-Poly1305 and HKDF, the control plane is HTTPS (TLS 1.2 with
+# the common CA bundle), and WireGuard wants a few more lwIP sockets and mailbox slots.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# MicroLink's own web config page would expose the tailnet settings on the VPN address;
+# the WIFI app has its own setup hotspot instead.
+CONFIG_ML_ENABLE_CONFIG_HTTPD=n
