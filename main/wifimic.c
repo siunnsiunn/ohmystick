@@ -64,6 +64,10 @@ static volatile bool     s_direct = false;
 static uint16_t          s_session = 0;
 static char              s_ap_ssid[33];
 static char              s_ap_pass[9];
+static volatile uint8_t  s_wifi_reason = 0;        // last disconnect reason (esp_wifi_types.h), 0 = none
+#define MAX_SCAN 16
+static wifi_ap_record_t  s_scan[MAX_SCAN];          // networks seen when the setup hotspot opened
+static uint16_t          s_scan_n = 0;
 
 // ---- settings ----------------------------------------------------------------
 static void get_str(nvs_handle_t h, const char *k, char *out, size_t n)
@@ -119,10 +123,12 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_ev, EV_GOT_IP);
-        ESP_LOGW(WTAG, "wifi disconnected, reason %d", ((wifi_event_sta_disconnected_t *)data)->reason);
+        s_wifi_reason = ((wifi_event_sta_disconnected_t *)data)->reason;
+        ESP_LOGW(WTAG, "wifi disconnected, reason %d", s_wifi_reason);
         esp_wifi_connect();                    // the driver paces its own retries
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ESP_LOGI(WTAG, "wifi up, ip " IPSTR, IP2STR(&((ip_event_got_ip_t *)data)->ip_info.ip));
+        s_wifi_reason = 0;
         xEventGroupSetBits(s_ev, EV_GOT_IP);
     }
 }
@@ -147,7 +153,11 @@ static bool wifi_sta_start(void)
     wifi_config_t wc = { 0 };
     strncpy((char *)wc.sta.ssid, s_cfg.ssid, sizeof(wc.sta.ssid) - 1);
     strncpy((char *)wc.sta.password, s_cfg.pass, sizeof(wc.sta.password) - 1);
-    wc.sta.threshold.authmode = s_cfg.pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    // Accept WPA/WPA2/WPA3 personal (phone hotspots and older routers vary).
+    wc.sta.threshold.authmode = s_cfg.pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
+    wc.sta.pmf_cfg.capable = true;
+    wc.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;        // pick the strongest AP with this name
     if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK) return false;
     if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK) return false;
     if (esp_wifi_start() != ESP_OK) return false;
@@ -216,8 +226,25 @@ static esp_err_t form_get(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_sendstr_chunk(req, k_form_head);
     httpd_resp_sendstr_chunk(req, "<form method=post action=/save>"
-        "<label>Wi-Fi 名稱（2.4 GHz）</label><input name=ssid value=\"");
+        "<label>Wi-Fi 名稱（2.4 GHz）</label><input name=ssid list=nets value=\"");
     html_escape(req, s_cfg.ssid);
+    httpd_resp_sendstr_chunk(req, "\"><datalist id=nets>");
+    for (int i = 0; i < s_scan_n; i++) {
+        httpd_resp_sendstr_chunk(req, "<option value=\"");
+        html_escape(req, (const char *)s_scan[i].ssid);
+        httpd_resp_sendstr_chunk(req, "\">");
+    }
+    httpd_resp_sendstr_chunk(req, "</datalist><small>Stick 看得到的 Wi-Fi：");
+    if (s_scan_n == 0) httpd_resp_sendstr_chunk(req, "（沒有）");
+    for (int i = 0; i < s_scan_n; i++) {
+        char sig[16];
+        snprintf(sig, sizeof(sig), "（%d）", s_scan[i].rssi);
+        if (i) httpd_resp_sendstr_chunk(req, "、");
+        html_escape(req, (const char *)s_scan[i].ssid);
+        httpd_resp_sendstr_chunk(req, sig);
+    }
+    httpd_resp_sendstr_chunk(req, "。不在清單上的網路 Stick 連不到（5 GHz 也看不到）。</small>");
+    httpd_resp_sendstr_chunk(req, "<input type=hidden name=_ value=\"");
     httpd_resp_sendstr_chunk(req, "\"><label>Wi-Fi 密碼</label><input name=pass type=password>"
         "<small>留空 = 沿用已存的密碼</small>"
         "<label>Tailscale auth key</label><input name=key placeholder=tskey-auth-...>"
@@ -301,9 +328,16 @@ static void setup_mode(void)
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.max_connection = 2;
     ap.ap.channel = 6;
-    esp_wifi_set_mode(WIFI_MODE_AP);
+    // AP+STA so the stick can list the networks it can actually hear (2.4 GHz only).
+    esp_netif_create_default_wifi_sta();
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &ap);
     if (esp_wifi_start() != ESP_OK) { ESP_LOGE(WTAG, "hotspot failed"); return; }
+    if (esp_wifi_scan_start(NULL, true) == ESP_OK) {
+        uint16_t n = MAX_SCAN;
+        if (esp_wifi_scan_get_ap_records(&n, s_scan) == ESP_OK) s_scan_n = n;
+        ESP_LOGI(WTAG, "scan: %u networks", (unsigned)s_scan_n);
+    }
 
     httpd_handle_t srv = NULL;
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
@@ -533,9 +567,20 @@ void wifimic_detail(char *a, size_t an, char *b, size_t bn)
         snprintf(a, an, "%s", s_ap_ssid);
         snprintf(b, bn, "PW %s", s_ap_pass);
         break;
-    case WIFIMIC_UI_WIFI:
+    case WIFIMIC_UI_WIFI: {
         snprintf(a, an, "%s", s_cfg.ssid);
+        uint8_t r = s_wifi_reason;
+        const char *why = "";
+        if (r == WIFI_REASON_NO_AP_FOUND || r == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+            r == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD || r == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD)
+            why = "找不到這個 Wi-Fi";
+        else if (r == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT || r == WIFI_REASON_HANDSHAKE_TIMEOUT ||
+                 r == WIFI_REASON_AUTH_FAIL || r == WIFI_REASON_MIC_FAILURE || r == 15)
+            why = "密碼可能錯誤";
+        if (r && why[0]) snprintf(b, bn, "%s(%u)", why, r);
+        else if (r)      snprintf(b, bn, "代碼 %u", r);
         break;
+    }
     case WIFIMIC_UI_TAILNET:
     case WIFIMIC_UI_PEER:
         snprintf(a, an, "%s", s_cfg.host);
