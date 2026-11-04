@@ -404,6 +404,8 @@ if IS_WINDOWS:
     user32.SetClipboardData.restype = wintypes.HANDLE
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
     kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
     kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
@@ -469,14 +471,31 @@ if IS_WINDOWS:
         finally:
             user32.CloseClipboard()
 
-    def set_clipboard_text(text: str) -> bool:
-        data = text.encode("utf-16-le") + b"\x00\x00"
+    def _alloc(data: bytes):
         h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
         if not h:
-            return False
+            return None
         p = kernel32.GlobalLock(h)
         ctypes.memmove(p, data, len(data))
         kernel32.GlobalUnlock(h)
+        return h
+
+    def _mark_private() -> None:
+        """Tell Windows this clipboard content is not for the clipboard history
+        (Win+V) or the cloud clipboard, so dictated text stays out of both.
+        Called with the clipboard open."""
+        for name, value in (("ExcludeClipboardContentFromMonitorProcessing", 0),
+                            ("CanIncludeInClipboardHistory", 0),
+                            ("CanUploadToCloudClipboard", 0)):
+            fmt = user32.RegisterClipboardFormatW(name)
+            h = _alloc(value.to_bytes(4, "little")) if fmt else None
+            if h and not user32.SetClipboardData(fmt, h):
+                kernel32.GlobalFree(h)
+
+    def set_clipboard_text(text: str, private: bool = False) -> bool:
+        h = _alloc(text.encode("utf-16-le") + b"\x00\x00")
+        if not h:
+            return False
         if not _open_clipboard():
             kernel32.GlobalFree(h)
             return False
@@ -485,13 +504,15 @@ if IS_WINDOWS:
             if not user32.SetClipboardData(CF_UNICODETEXT, h):
                 kernel32.GlobalFree(h)
                 return False
+            if private:
+                _mark_private()
             return True  # the clipboard owns h now
         finally:
             user32.CloseClipboard()
 
     def paste_text(text: str, restore: bool) -> None:
         old = get_clipboard_text() if restore else None
-        if not set_clipboard_text(text):
+        if not set_clipboard_text(text, private=True):
             log.warning("clipboard busy, typing instead")
             type_text(text)
             return

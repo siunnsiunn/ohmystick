@@ -95,7 +95,7 @@ powershell -ExecutionPolicy Bypass -File install-startup.ps1
 | `Ctrl+Shift+F12`（鍵盤） | 結束 winvoice |
 | 兩聲低音 | 失敗、沒聽到聲音或太短，看記錄檔 |
 
-- 停止前先把游標點在要輸入的欄位。貼上會用剪貼簿，貼完會把原本的文字放回去。
+- 停止前先把游標點在要輸入的欄位。貼上會用剪貼簿，貼完會把原本的文字放回去；辨識出的文字會標記為不進 Windows 剪貼簿記錄（Win+V）與雲端剪貼簿。要完全不碰剪貼簿，把 `output` 設成 `type`（逐字輸入）。
 - 辨識還在跑時可以直接開始下一段，結果會依序貼上。
 - Stick **長按前鍵會送 Enter**。在病歷系統裡誤觸可能直接送出表單，
   可以在 [設定頁](https://openbrt.github.io/voxstick/config.html)把長按改成「不發送按鍵」
