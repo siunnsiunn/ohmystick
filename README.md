@@ -100,6 +100,8 @@ Stick 是一個複合 USB 裝置，電腦同時看到一支 16 kHz 麥克風和�
 
 平放（螢幕朝上）時，IMU 會自動把麥克風靜音。上游的[網頁設定頁](https://openbrt.github.io/voxstick/config.html)可以改自動靜音與單擊、長按的快捷鍵。本韌體沿用同樣的 USB 識別碼與設定協定，原則上可用，但我沒有實際用這個頁面測過。
 
+**Windows 聽寫**：跑不動本機 Whisper 的 Windows 電腦（或不支援繁中 Win+H 的 Windows 10），可以用 [`tools/winvoice`](tools/winvoice/README.md)：在 USB 麥克風模式下按前鍵錄音，送 Azure 語音或 Groq Whisper 轉成繁體中文後貼上。
+
 ## 文件
 
 | 文件 | 內容 |
@@ -107,6 +109,7 @@ Stick 是一個複合 USB 裝置，電腦同時看到一支 16 kHz 麥克風和�
 | [`docs/BT-MIC.md`](docs/BT-MIC.md) | 藍牙錄音協定、Mac 端程式、環境變數、踩過的坑 |
 | [`docs/DIAG.md`](docs/DIAG.md) | 狀態頁與重開機代碼怎麼讀、字型產生規則 |
 | [`docs/INBOX.md`](docs/INBOX.md) | 語音筆記收件夾與 agent 取件介面 |
+| [`tools/winvoice/README.md`](tools/winvoice/README.md) | Windows 聽寫小程式（Azure 語音／Groq Whisper，USB 麥克風模式） |
 | [`docs/WIFI-PLAN.md`](docs/WIFI-PLAN.md) | Wi-Fi 聽寫計畫（草案，經 Tailscale 送到 Windows 電腦） |
 | [`docs/NOTE-CLOUD.md`](docs/NOTE-CLOUD.md) | 筆記上雲的研究與選用的雲端資料夾複本 |
 | [`SESSION-NOTES.md`](SESSION-NOTES.md) | 上游 voxstick 的開發紀錄（電源晶片、ES8311 等問題） |
