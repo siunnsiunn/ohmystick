@@ -113,6 +113,8 @@ CLINIC（winvoice 加上網路接收端）
 - winvoice：新增網路接收模式（只聽 Tailscale 介面），解 ADPCM、組 WAV，交給既有的轉寫與貼上流程，
   狀態回傳 Stick。安裝腳本加上 Windows 防火牆規則，只允許 Tailscale 網段連入。
 - Tailscale 存取規則（ACL）：只允許 Stick 這個節點連到 CLINIC 的 winvoice 埠。
+- Mac：btmic 新增網路接收模式，和 winvoice 共用同一套幀格式與狀態回傳；Mac 需在同一個 tailnet（或同一區網）。
+  Stick 一次只連一個接收端，目標（CLINIC 或 Mac）在階段 1 的設定頁選擇。
 
 **通過標準**：在 CLINIC 的記事本裡，按前鍵說一句話、再按一次，文字在約 3 秒內出現；連續使用 30 分鐘不出錯。
 
@@ -120,6 +122,7 @@ CLINIC（winvoice 加上網路接收端）
 
 - 沒連上時錄音存進 Stick 收件匣；連上後自動補傳，winvoice 把文字寫進收件夾檔案，不貼上。
 - 沿用 BT-MIC 的補傳確認規則：DONE / ERR 帶錄音編號，相符才刪 Stick 上的那一筆。
+- Mac 端同樣支援網路補傳，寫入既有的 `~/btmic-inbox` 與 iCloud 收件夾流程，不在外面時也能補傳。
 
 ### 階段 4：無線更新（OTA）
 
@@ -152,4 +155,5 @@ CLINIC（winvoice 加上網路接收端）
 
 1. ~~第七個 App 的位置~~：選單一頁最多八格，直接加在第三格。
 2. 階段 T 的結果決定走 Tailscale 或區網直連。
-3. Wi-Fi 聽寫是否也要支援在 Mac 上用（btmic 加網路接收）；目前只規劃 CLINIC。
+3. ~~Wi-Fi 聽寫是否也要支援在 Mac 上用~~：**已決定要支援**。btmic 加網路接收端，協定與 winvoice 相同，
+   做在階段 2 以後（見階段 2、3），不影響階段 T。Mac 在身邊時 BLE 仍是主要路徑，Wi-Fi 補不在 Mac 旁的情況。
