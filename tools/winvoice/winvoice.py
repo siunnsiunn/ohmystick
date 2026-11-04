@@ -29,11 +29,14 @@ import argparse
 import array
 import configparser
 import io
+import ipaddress
 import json
 import logging
 import logging.handlers
 import os
 import queue
+import socket
+import struct
 import sys
 import threading
 import time
@@ -72,6 +75,8 @@ DEFAULTS = {
     "beep": "true",
     "log_text": "false",
     "timeout": "30",
+    "wifi_port": "47100",
+    "wifi_allow": "100.64.0.0/10",
 }
 
 
@@ -103,6 +108,9 @@ class Config:
         self.beep = s.getboolean("beep")
         self.log_text = s.getboolean("log_text")
         self.timeout = s.getfloat("timeout")
+        self.wifi_port = s.getint("wifi_port")
+        self.wifi_allow = [ipaddress.ip_network(n.strip(), strict=False)
+                           for n in s.get("wifi_allow").split(",") if n.strip()]
         if self.backend == "short":
             # The short-audio API rejects anything over 60 s.
             self.max_seconds = min(self.max_seconds, 58)
@@ -374,6 +382,144 @@ def transcribe(wav: bytes, cfg: Config, phrases: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Wi-Fi: recordings from the stick's WIFI app over Tailscale (docs/WIFI-PLAN.md)
+#
+# The stick connects to us. stick -> PC: u16 length + one docs/BT-MIC.md frame;
+# PC -> stick: b"C" + status + session (u16), status 1 BUSY, 2 DONE, 3 ERR, 5 PING.
+# --------------------------------------------------------------------------
+
+ADPCM_STEP = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
+    253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
+    1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
+    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487,
+    12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767)
+ADPCM_INDEX = (-1, -1, -1, -1, 2, 4, 6, 8) * 2
+
+FRAME_AUDIO, FRAME_END, FRAME_START = 1, 2, 3
+CTRL_BUSY, CTRL_DONE, CTRL_ERR, CTRL_PING = 1, 2, 3, 5
+
+
+def adpcm_decode(data: bytes, pred: int, idx: int) -> bytes:
+    """IMA ADPCM, low nibble first, as main/btmic.c encodes it."""
+    out = array.array("h")
+    for byte in data:
+        for code in (byte & 0x0F, byte >> 4):
+            step = ADPCM_STEP[idx]
+            diff = step >> 3
+            if code & 4:
+                diff += step
+            if code & 2:
+                diff += step >> 1
+            if code & 1:
+                diff += step >> 2
+            pred = pred - diff if code & 8 else pred + diff
+            pred = max(-32768, min(32767, pred))
+            idx = max(0, min(88, idx + ADPCM_INDEX[code]))
+            out.append(pred)
+    if sys.byteorder != "little":
+        out.byteswap()
+    return out.tobytes()
+
+
+def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+class StickServer:
+    """Accepts the stick's TCP connection. For each finished recording it calls
+    on_recording(pcm, reply, stats); reply(status) sends BUSY/DONE/ERR back."""
+
+    def __init__(self, cfg: Config, on_recording):
+        self.cfg = cfg
+        self.on_recording = on_recording
+
+    def start(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.cfg.wifi_port))
+        srv.listen(2)
+        log.info("waiting for the stick on TCP port %d", self.cfg.wifi_port)
+        threading.Thread(target=self._accept, args=(srv,), daemon=True).start()
+
+    def _allowed(self, ip: str) -> bool:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or any(addr in n for n in self.cfg.wifi_allow)
+
+    def _accept(self, srv: socket.socket) -> None:
+        while True:
+            conn, (ip, port) = srv.accept()
+            if not self._allowed(ip):
+                log.warning("refused a connection from %s (not in wifi_allow)", ip)
+                conn.close()
+                continue
+            log.info("stick connected from %s", ip)
+            threading.Thread(target=self._serve, args=(conn, ip), daemon=True).start()
+
+    def _serve(self, conn: socket.socket, ip: str) -> None:
+        lock = threading.Lock()
+        alive = threading.Event()
+        alive.set()
+
+        def send_ctrl(status: int, session: int) -> None:
+            try:
+                with lock:
+                    conn.sendall(b"C" + bytes([status, session & 0xFF, (session >> 8) & 0xFF]))
+            except OSError:
+                alive.clear()
+
+        def pinger() -> None:
+            while alive.is_set():
+                send_ctrl(CTRL_PING, 0)
+                time.sleep(2)
+
+        threading.Thread(target=pinger, daemon=True).start()
+        session, pcm, expect, lost, t_start = None, bytearray(), 0, 0, 0.0
+        try:
+            conn.settimeout(30)  # the stick only talks while recording; pings keep TCP alive
+            while alive.is_set():
+                try:
+                    head = _recv_exact(conn, 2)
+                except socket.timeout:
+                    continue
+                if head is None:
+                    break
+                n = head[0] | head[1] << 8
+                frame = _recv_exact(conn, n) if n else b""
+                if frame is None or len(frame) < 12:
+                    break
+                ver, ftype, sess, seq, codec, flags, pred, idx = struct.unpack_from("<BBHHBBhB", frame)
+                if ftype == FRAME_START:
+                    session, pcm, expect, lost, t_start = sess, bytearray(), 1, 0, time.monotonic()
+                elif ftype == FRAME_AUDIO and sess == session:
+                    if seq > expect:  # TCP should never lose frames; keep the timing if it does
+                        lost += seq - expect
+                        pcm += b"\0\0" * 320 * (seq - expect)
+                    pcm += adpcm_decode(frame[12:], pred, idx)
+                    expect = seq + 1
+                elif ftype == FRAME_END and sess == session:
+                    stats = {"session": session, "frames": expect - 1, "lost": lost, "ip": ip,
+                             "seconds": len(pcm) / 2 / RATE, "wall": time.monotonic() - t_start}
+                    send_ctrl(CTRL_BUSY, session)
+                    s_ = session
+                    self.on_recording(bytes(pcm), lambda st, s_=s_: send_ctrl(st, s_), stats)
+                    session = None
+        except OSError as e:
+            log.info("stick connection error: %s", e)
+        finally:
+            alive.clear()
+            conn.close()
+            log.info("stick disconnected (%s)", ip)
+
+
+# --------------------------------------------------------------------------
 # Windows: hotkey, clipboard, keystrokes, beeps
 # --------------------------------------------------------------------------
 
@@ -608,7 +754,7 @@ class App:
             pcm = self.recorder.stop()
             self.recording = False
             self.notify("stop")
-            self.jobs.put(pcm)
+            self.jobs.put((pcm, None))
 
     def _timeout(self, generation: int) -> None:
         # Hand the stop to the main thread so toggle() only ever runs there.
@@ -617,37 +763,45 @@ class App:
 
     def _worker(self) -> None:
         while True:
-            pcm = self.jobs.get()
+            pcm, reply = self.jobs.get()
+            ok = False
             try:
-                self._process(pcm)
+                ok = self._process(pcm)
             except Exception:
                 log.exception("unexpected error")
                 self.notify("error")
+            if reply:
+                reply(CTRL_DONE if ok else CTRL_ERR)
 
-    def _process(self, pcm: bytes) -> None:
+    def on_stick_recording(self, pcm: bytes, reply, stats: dict) -> None:
+        log.info("stick: %.1f s audio, %d frames, %d lost", stats["seconds"], stats["frames"], stats["lost"])
+        self.jobs.put((pcm, reply))
+
+    def _process(self, pcm: bytes) -> bool:
         secs = len(pcm) / 2 / RATE
         peak = pcm_peak(pcm)
         if secs < self.cfg.min_seconds or peak < self.cfg.silence_peak:
             # Do not spend quota on an accidental tap or a muted (flat) stick.
             log.info("skipped: %.1f s, peak %d", secs, peak)
             self.notify("error")
-            return
+            return False
         t0 = time.monotonic()
         try:
             text = transcribe(pcm_to_wav(pcm), self.cfg, load_phrases(self.cfg.vocab_file))
         except TranscribeError as e:
             log.error("transcription failed (%.1f s audio): %s", secs, e)
             self.notify("error")
-            return
+            return False
         log.info("%.1f s audio -> %d chars in %.1f s%s", secs, len(text), time.monotonic() - t0,
                  f": {text}" if self.cfg.log_text else "")
         if not text:
             self.notify("error")
-            return
+            return False
         if self.cfg.output == "type":
             type_text(text)
         else:
             paste_text(text, self.cfg.restore_clipboard)
+        return True
 
     def run(self) -> int:
         self.main_thread_id = kernel32.GetCurrentThreadId()
@@ -661,6 +815,11 @@ class App:
             log.warning("Ctrl+Shift+F12 (quit) is taken; end winvoice from Task Manager")
         log.info("ready: Ctrl+F12 to dictate, Ctrl+Shift+F12 to quit (%s, %s)",
                  self.cfg.backend, self.cfg.language)
+        if self.cfg.wifi_port:
+            try:
+                StickServer(self.cfg, self.on_stick_recording).start()
+            except OSError as e:
+                log.error("cannot listen on TCP port %d for the stick: %s", self.cfg.wifi_port, e)
         self.notify("ready")
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -692,12 +851,37 @@ def setup_logging(console: bool) -> None:
                         format="%(asctime)s %(levelname)s %(message)s")
 
 
+def wifi_test(cfg: Config) -> int:
+    """Stage T of docs/WIFI-PLAN.md: no transcription, no keys needed."""
+    port = cfg.wifi_port or 47100
+    cfg.wifi_port = port
+
+    def got(pcm: bytes, reply, st: dict) -> None:
+        name = f"wifi-test-{st['session']}.wav"
+        with open(name, "wb") as f:
+            f.write(pcm_to_wav(pcm))
+        print(f"session {st['session']} from {st['ip']}: {st['seconds']:.1f} s audio, "
+              f"{st['frames']} frames, {st['lost']} lost, sent in {st['wall']:.1f} s, "
+              f"peak {pcm_peak(pcm)} -> {name}", flush=True)
+        reply(CTRL_DONE)
+
+    StickServer(cfg, got).start()
+    print(f"Waiting for the stick on TCP port {port}. Hold its front button and talk; Ctrl+C quits.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Ctrl+F12 dictation via Azure Speech or Groq")
     ap.add_argument("--config", help="path to winvoice.ini")
     ap.add_argument("--list-devices", action="store_true", help="list input devices")
     ap.add_argument("--test", action="store_true", help="record 5 s, transcribe, print")
     ap.add_argument("--file", help="transcribe a 16 kHz mono 16-bit WAV and print")
+    ap.add_argument("--wifi-test", action="store_true",
+                    help="wait for the stick over Wi-Fi, save each recording as a WAV and print stats")
     args = ap.parse_args(argv)
     setup_logging(console=True)
 
@@ -714,6 +898,8 @@ def main(argv=None) -> int:
         return 0
 
     cfg = Config(args.config)
+    if args.wifi_test:
+        return wifi_test(cfg)
     errs = cfg.validate()
     if errs:
         for e in errs:

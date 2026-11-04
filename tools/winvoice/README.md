@@ -126,3 +126,15 @@ powershell -ExecutionPolicy Bypass -File install-startup.ps1
 錄音會經 HTTPS 送到雲端辨識，不留在本機：Azure 送到你選的區域，Groq 送到 Groq 的伺服器（美國公司）。
 診所使用前，請依院所規範確認病患語音送雲端是否可以接受；各家如何保存、使用語音資料，
 請以 Azure 和 Groq 的官方條款為準（這裡沒有替你查證）。
+
+## Wi-Fi（測試中）
+
+Stick 的「Wi-Fi 聽寫」App 會經 Wi-Fi 和 Tailscale 把錄音送到 winvoice，不需要 USB 線，也不用按鍵盤。
+計畫與測試步驟見 [`docs/WIFI-PLAN.md`](../../docs/WIFI-PLAN.md)。
+
+- `py winvoice.py --wifi-test`：只收錄音、存成 `wifi-test-<編號>.wav`，不轉寫、不需要金鑰。用來驗證連線。
+- 一般執行（`py winvoice.py`）時，winvoice 也會同時等 Stick 連進來；收到的錄音照設定轉寫並貼到游標處。
+- `winvoice.ini` 的 `wifi_port`（預設 47100，0 = 關閉）、`wifi_allow`（預設只接受 Tailscale 位址 `100.64.0.0/10`）。
+- Windows 防火牆要先允許（系統管理員命令提示字元，一次就好）：
+  `netsh advfirewall firewall add rule name="winvoice wifi" dir=in action=allow protocol=TCP localport=47100 remoteip=100.64.0.0/10`
+

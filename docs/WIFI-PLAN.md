@@ -3,7 +3,8 @@
 讓 Stick 不靠 USB 線、也不靠電腦藍牙，經 Wi-Fi 把錄音送到診所的 Windows 電腦（CLINIC），
 由 [`tools/winvoice`](../tools/winvoice/README.md) 送雲端轉寫後貼到游標處。
 
-狀態：**計畫，尚未實作**。各階段都要刷到實機上測過才算完成。
+狀態：**階段 T 已實作、可編譯，尚未在實機上測試**（`main/wifimic.c`、`tools/winvoice` 的 `--wifi-test`）。
+各階段都要刷到實機上測過才算完成。
 
 ## 背景
 
@@ -68,6 +69,33 @@ CLINIC（winvoice 加上網路接收端）
 
 **不通過**：改走附錄的區網直連方案，階段 1 以後照做，只有傳輸層不同。
 
+#### 實作（已完成，待實機測試）
+
+- 韌體：選單第三格「Wi-Fi 聽寫」（`main/wifimic.c`）。Tailscale 用 [MicroLink](https://github.com/CamM2325/microlink)
+  （MIT，固定在 `216da33`，子模組 `third_party/microlink`）。設定不寫進韌體，由手機在 Stick 的設定熱點填寫，
+  所以同一份韌體大家都能刷。
+- 編譯結果（ESP-IDF 5.5.1）：程式 0x161f00，factory 分區 0x177000 只剩 6%；DIRAM 用了 57.6%。
+  階段 1 改分區表時要把程式分區加大。
+- 電腦：`py winvoice.py --wifi-test`，不轉寫，只把每段錄音存成 `wifi-test-<編號>.wav` 並印出統計。
+  用模擬的 Stick 測過：協定、ADPCM 解碼、PING／BUSY／DONE 都正確。
+
+#### 測試步驟
+
+1. **刷韌體**（要傳輸線）。CLINIC 上：`py -m pip install esptool`；Stick 按住電源鍵約 2 秒到綠燈閃（下載模式），然後
+   `py -m esptool --chip esp32s3 -b 460800 write_flash 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 voxstick.bin`。
+   只寫這三段，不會清掉 NVS（藍牙配對和設定都保留）。
+2. **Tailscale 金鑰**：後台 Settings → Keys → Generate auth key，勾 Reusable；建議加 tag。
+   Stick 加入後，在 Machines 裡對它選 Disable key expiry。
+3. **設定 Stick**：選單進「Wi-Fi 聽寫」，第一次會進設定模式，畫面顯示熱點名稱（`OHMYSTICK-xxxx`）和 8 位數密碼。
+   手機連上，瀏覽 `http://192.168.4.1`，填診所 Wi-Fi、auth key、電腦位址（`tailscale ip -4` 的結果），按儲存。
+4. **電腦開接收端**：CLINIC 上先允許連入（系統管理員命令提示字元，一次就好）：
+   `netsh advfirewall firewall add rule name="winvoice wifi" dir=in action=allow protocol=TCP localport=47100 remoteip=100.64.0.0/10`，
+   然後 `py winvoice.py --wifi-test`。
+5. **Stick 重開後進「Wi-Fi 聽寫」**：依序顯示 連線中（Wi-Fi）→ 連線中（Tailscale）→ 未連線（找電腦）→ 可錄音。
+   按住前鍵說話、放開，電腦會印出秒數、幀數、遺失數，並存成 WAV，Stick 顯示「完成」。
+6. **回報**：從開機到「可錄音」花多久、畫面下方顯示 DIRECT 還是 RELAY、`--wifi-test` 印出的遺失數、WAV 聽起來是否正常，
+   以及用 30 分鐘後有沒有斷線、電量掉多少。
+
 ### 階段 1：Wi-Fi 基礎與設定
 
 - **分區表**：改成可無線更新（OTA）的配置，例如 `otadata` 加兩個約 2 MB 的程式分區，收件匣維持 3 MB
@@ -122,6 +150,6 @@ CLINIC（winvoice 加上網路接收端）
 
 ## 待決定
 
-1. 第七個 App 的位置：選單翻頁，或移除／合併哪一個 App。
+1. ~~第七個 App 的位置~~：選單一頁最多八格，直接加在第三格。
 2. 階段 T 的結果決定走 Tailscale 或區網直連。
 3. Wi-Fi 聽寫是否也要支援在 Mac 上用（btmic 加網路接收）；目前只規劃 CLINIC。
