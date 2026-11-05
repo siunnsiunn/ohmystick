@@ -12,7 +12,7 @@
 |---|---|---|
 | `bootloader.bin` | `0x0` | `01ff8d7066155330d2b38645cd7690d79b6081896afde4b9d7160ae7a9c1ec90` |
 | `partition-table.bin` | `0x8000` | `5295e8c42d6fb5f95e4e8a185932c6191d27cfc5078322475347e40e71af815a` |
-| `voxstick.bin` | `0x10000` | `8d9598a34d9ba91f4f14bdd1c219d6eb50da9c5c9012516831fbce01352cc796` |
+| `voxstick.bin` | `0x10000` | `c91f2c6041126d56e4b9f6e54de118e3accf366b77a09dcd853121d97eec596b` |
 
 ## 刷入（Windows）
 
@@ -37,7 +37,7 @@ py -m esptool --chip esp32s3 -b 460800 write_flash 0x0 bootloader.bin 0x8000 par
 4. **防火牆**（系統管理員命令提示字元，一次就好）：
    `netsh advfirewall firewall add rule name="winvoice lan" dir=in action=allow protocol=TCP localport=47100 remoteip=192.168.1.0/24`
 5. 在 `C:\winvoice` 執行 `py winvoice.py --wifi-test`，先放著。
-6. **Stick 設定**：選單進第三格「Wi-Fi 聽寫」，因為還沒有配對密碼，會進設定模式，畫面顯示 `OHMYSTICK-xxxx` 和 8 位數密碼。
+6. **Stick 設定**：選單進第三格「Wi-Fi 聽寫」，因為還沒有配對密碼，會進設定模式，畫面顯示 `OHMYSTICK-xxxx` 和 12 個字元的熱點密碼（分兩行，大寫英文與數字，沒有 0/O、1/I/L 這類易混字）。
    手機連上，瀏覽 `http://192.168.4.1`：
    - Wi-Fi 名稱、密碼：診所 Wi-Fi（密碼留空 = 沿用已存的）
    - 配對密碼：第 2 步那 20 個字
