@@ -66,7 +66,7 @@ static volatile TickType_t s_ctrl_until = 0;
 static volatile TickType_t s_last_ping = 0;
 static uint16_t          s_session = 0;
 static char              s_ap_ssid[33];
-static char              s_ap_pass[13];
+static char              s_ap_pass[17];
 static volatile uint8_t  s_wifi_reason = 0;        // last disconnect reason (esp_wifi_types.h), 0 = none
 #define MAX_SCAN 16
 static wifi_ap_record_t  s_scan[MAX_SCAN];          // networks seen when the setup hotspot opened
@@ -323,12 +323,12 @@ static void setup_mode(void)
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "OHMYSTICK-%02X%02X", mac[4], mac[5]);
-    // 12 characters from 31 symbols without look-alikes (no 0/O, 1/I, L): about 59 bits, so a
-    // captured WPA2 handshake can not be cracked offline. The pairing key is typed through this
-    // hotspot, which is why it must not be guessable.
-    static const char alphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    for (int i = 0; i < 12; i++) s_ap_pass[i] = alphabet[esp_random() % 31];
-    s_ap_pass[12] = '\0';
+    // 16 characters from 16 symbols that are hard to confuse on the pixel font (no 0/O, 1/I/L,
+    // 2/Z, 5/S, 8/B, U/V, A/R, D/Q): 64 bits, so a captured WPA2 handshake can not be cracked
+    // offline. The pairing key is typed through this hotspot, which is why it must not be guessable.
+    static const char alphabet[] = "CEFHJKMNPTWX3479";
+    for (int i = 0; i < 16; i++) s_ap_pass[i] = alphabet[esp_random() % 16];
+    s_ap_pass[16] = '\0';
 
     esp_netif_create_default_wifi_ap();
     wifi_config_t ap = { 0 };

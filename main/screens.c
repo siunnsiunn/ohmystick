@@ -125,7 +125,7 @@ void lcd_draw_wifimic(int ui)
 {
     static const struct { const char *word; uint16_t col; const char *hint; } k[] = {
         [WIFIMIC_UI_OFF]     = { "啟動中", COL_ORANGE, "" },
-        [WIFIMIC_UI_SETUP]   = { "設定",   COL_YELLOW, "手機連上後開 192.168.4.1" },
+        [WIFIMIC_UI_SETUP]   = { "設定",   COL_YELLOW, "開 192.168.4.1" },
         [WIFIMIC_UI_SAVED]   = { "已儲存", COL_GREEN,  "重新開機中" },
         [WIFIMIC_UI_WIFI]    = { "連線中", COL_ORANGE, "Wi-Fi" },
         [WIFIMIC_UI_TAILNET] = { "連線中", COL_ORANGE, "Tailscale" },
@@ -145,13 +145,13 @@ void lcd_draw_wifimic(int ui)
     zh_center(34, "Wi-Fi聽寫", COL_LIGHT_GRAY, 2);
     zh_center(ui == WIFIMIC_UI_SETUP ? 66 : (LCD_H - 36) / 2, k[ui].word, k[ui].col, 3);
     if (ui == WIFIMIC_UI_SETUP) {                   // hotspot name and password, large enough to type
-        zh_center(116, a, COL_WHITE, 1);
-        char l1[8] = {0}, l2[8] = {0};                // the 12-character hotspot password, 6 + 6
+        zh_center(112, a, COL_WHITE, 1);
+        char l1[9] = {0}, l2[9] = {0};                // the 16-character hotspot password, 8 + 8
         strlcpy(l1, b, sizeof(l1));
-        if (strlen(b) > 6) strlcpy(l2, b + 6, sizeof(l2));
-        zh_center(132, l1, COL_WHITE, 2);
-        zh_center(152, l2, COL_WHITE, 2);
-        zh_center(170, "手機連這個 Wi-Fi", COL_LIGHT_GRAY, 1);
+        if (strlen(b) > 8) strlcpy(l2, b + 8, sizeof(l2));
+        zh_center(128, l1, COL_WHITE, 2);
+        zh_center(150, l2, COL_WHITE, 2);
+        zh_center(180, "手機連這個 Wi-Fi", COL_LIGHT_GRAY, 1);
     } else {
         zh_center(160, a, COL_LIGHT_GRAY, 1);
         zh_center(176, b, COL_LIGHT_GRAY, 1);
