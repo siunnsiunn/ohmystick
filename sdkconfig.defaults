@@ -50,3 +50,20 @@ CONFIG_BT_NIMBLE_HID_SERVICE=y
 CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# --- Wi-Fi (WIFI app) ------------------------------------------------------------------
+# These came in with the Tailscale client of stage T (ChaCha20-Poly1305, HKDF, the CA bundle,
+# more lwIP sockets and mailbox slots). The LAN version does not need them, but they are kept so
+# the image that was tested in the clinic stays as it was; trim them in a separate, tested change.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_RCVBUF=y
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_MBEDTLS_CHACHA20_C=y
+CONFIG_MBEDTLS_POLY1305_C=y
+CONFIG_MBEDTLS_CHACHAPOLY_C=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

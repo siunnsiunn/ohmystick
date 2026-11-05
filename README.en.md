@@ -110,6 +110,7 @@ Lying flat with the screen up mutes the mic through the IMU. Upstream's [web con
 | [`docs/DIAG.md`](docs/DIAG.md) | Reading the status page and reset codes, font generation |
 | [`docs/INBOX.md`](docs/INBOX.md) | Voice-note inbox and the agent interface |
 | [`tools/winvoice/README.md`](tools/winvoice/README.md) | Windows dictation helper (Azure Speech / Groq Whisper, USB MIC mode; in Chinese) |
+| [`docs/WIFI-PLAN.md`](docs/WIFI-PLAN.md) | Wi-Fi dictation plan (draft, via Tailscale to a Windows PC; in Chinese) |
 | [`docs/NOTE-CLOUD.md`](docs/NOTE-CLOUD.md) | Research on cloud inboxes and the optional synced-folder copy |
 | [`SESSION-NOTES.md`](SESSION-NOTES.md) | Upstream bring-up log (PMIC, ES8311 and other rough edges) |
 

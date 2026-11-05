@@ -126,3 +126,24 @@ powershell -ExecutionPolicy Bypass -File install-startup.ps1
 錄音會經 HTTPS 送到雲端辨識，不留在本機：Azure 送到你選的區域，Groq 送到 Groq 的伺服器（美國公司）。
 診所使用前，請依院所規範確認病患語音送雲端是否可以接受；各家如何保存、使用語音資料，
 請以 Azure 和 Groq 的官方條款為準（這裡沒有替你查證）。
+
+## Wi-Fi
+
+Stick 的「Wi-Fi 聽寫」App 會經診所區網把錄音送到 winvoice，不需要 USB 線。單擊前鍵開始、再單擊一下停止並送出
+（Stick 平放時不錄音）。刷入與設定步驟見 [`docs/firmware/wifi-lan/README.md`](../../docs/firmware/wifi-lan/README.md)，
+設計與測試記錄見 [`docs/WIFI-PLAN.md`](../../docs/WIFI-PLAN.md)。
+
+**連線有驗證也有加密**：Stick 和電腦用同一組配對密碼互相證明身分，之後每筆資料用 AES-256-GCM 加密。
+**沒設 `wifi_key`（至少 12 個字元）就不接受 Stick 連線**，一般模式也不會開網路接收。
+
+1. 電腦裝套件：`py -m pip install cryptography`
+2. 產生配對密碼：`py -c "import secrets;print(secrets.token_hex(10))"`，填進 `winvoice.ini` 的 `wifi_key`，
+   同一組也填進 Stick 的設定頁。
+3. `winvoice.ini` 的 `wifi_port`（預設 47100，0 = 關閉）、`wifi_allow`（預設 `192.168.0.0/16, 100.64.0.0/10`，
+   想更嚴可改成診所網段，例如 `192.168.1.0/24`）。
+4. Windows 防火牆要先允許（系統管理員命令提示字元，一次就好）：
+   `netsh advfirewall firewall add rule name="winvoice lan" dir=in action=allow protocol=TCP localport=47100 remoteip=192.168.1.0/24`
+   （網段換成你的區網）。
+5. `py winvoice.py --wifi-test`：只收錄音、存成 `wifi-test-<編號>.wav`，不轉寫、不需要雲端金鑰（仍要 `wifi_key`），
+   用來驗證連線。一般執行（`py winvoice.py`）時，收到的錄音照設定轉寫並貼到游標處。
+
