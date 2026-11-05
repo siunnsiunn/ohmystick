@@ -14,6 +14,8 @@
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "lwip/netdb.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/md.h"
 #include "lwip/sockets.h"
 #include "nvs.h"
 
@@ -33,6 +35,7 @@ static const char *WTAG = "wifimic";
 
 #define NVS_NS            "wifimic"
 #define DEFAULT_PORT      47100
+#define PSK_MIN_LEN       12
 #define SAMPLES_PER_FRAME 320                // 20 ms at 16 kHz
 #define HEADER_LEN        12
 #define FRAME_LEN         (HEADER_LEN + SAMPLES_PER_FRAME / 2)
@@ -47,7 +50,7 @@ enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3, CTRL_PING = 5 };
 typedef struct {
     char     ssid[33];
     char     pass[65];
-    char     key[128];                       // pairing key (unused until the encryption step)
+    char     psk[65];                        // pairing key, the same text as wifi_key in winvoice.ini
     char     host[64];                       // PC: LAN IPv4 address or host name
     uint16_t port;
 } wcfg_t;
@@ -84,12 +87,12 @@ static bool cfg_load(void)
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     get_str(h, "ssid", s_cfg.ssid, sizeof(s_cfg.ssid));
     get_str(h, "pass", s_cfg.pass, sizeof(s_cfg.pass));
-    get_str(h, "key", s_cfg.key, sizeof(s_cfg.key));
+    get_str(h, "psk", s_cfg.psk, sizeof(s_cfg.psk));
     get_str(h, "host", s_cfg.host, sizeof(s_cfg.host));
     uint16_t port;
     if (nvs_get_u16(h, "port", &port) == ESP_OK && port) s_cfg.port = port;
     nvs_close(h);
-    return s_cfg.ssid[0] && s_cfg.host[0];
+    return s_cfg.ssid[0] && s_cfg.host[0] && strlen(s_cfg.psk) >= PSK_MIN_LEN;
 }
 
 static bool setup_flag(bool clear)
@@ -247,8 +250,8 @@ static esp_err_t form_get(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "<input type=hidden name=_ value=\"");
     httpd_resp_sendstr_chunk(req, "\"><label>Wi-Fi 密碼</label><input name=pass type=password>"
         "<small>留空 = 沿用已存的密碼</small>"
-        "<label>配對密碼（加密用，目前可留空）</label><input name=key>"
-        "<small>留空 = 沿用已存的密碼</small>"
+        "<label>配對密碼（至少 12 個字元，和電腦 winvoice.ini 的 wifi_key 一樣）</label><input name=psk autocapitalize=off autocorrect=off spellcheck=false>"
+        "<small>留空 = 沿用已存的配對密碼；第一次設定一定要填</small>"
         "<label>電腦的區網位址</label><input name=host placeholder=192.168.1.x value=\"");
     html_escape(req, s_cfg.host);
     httpd_resp_sendstr_chunk(req, "\"><label>winvoice 埠號</label><input name=port inputmode=numeric value=\"");
@@ -285,8 +288,8 @@ static esp_err_t form_post(httpd_req_t *req)
     form_field(body, "ssid", c.ssid, sizeof(c.ssid));
     form_field(body, "pass", tmp, sizeof(c.pass));
     if (tmp[0]) strlcpy(c.pass, tmp, sizeof(c.pass));
-    form_field(body, "key", tmp, sizeof(tmp));
-    if (tmp[0]) strlcpy(c.key, tmp, sizeof(c.key));
+    form_field(body, "psk", tmp, sizeof(tmp));
+    if (tmp[0]) strlcpy(c.psk, tmp, sizeof(c.psk));
     form_field(body, "host", c.host, sizeof(c.host));
     form_field(body, "port", port, sizeof(port));
     int pv = atoi(port);
@@ -296,8 +299,10 @@ static esp_err_t form_post(httpd_req_t *req)
     bool ok = nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK;
     if (ok) {
         ok = nvs_set_str(h, "ssid", c.ssid) == ESP_OK && nvs_set_str(h, "pass", c.pass) == ESP_OK &&
-             nvs_set_str(h, "key", c.key) == ESP_OK && nvs_set_str(h, "host", c.host) == ESP_OK &&
-             nvs_set_u16(h, "port", c.port) == ESP_OK && nvs_commit(h) == ESP_OK;
+             nvs_set_str(h, "psk", c.psk) == ESP_OK && nvs_set_str(h, "host", c.host) == ESP_OK &&
+             nvs_set_u16(h, "port", c.port) == ESP_OK;
+        nvs_erase_key(h, "key");               // the Tailscale auth key from stage T, no longer used
+        ok = ok && nvs_commit(h) == ESP_OK;
         nvs_close(h);
     }
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -421,12 +426,93 @@ static int net_recv(int fd, uint8_t *buf, size_t n, int timeout_ms)
     return -1;                                 // 0 = the PC closed the connection
 }
 
+// ---- authenticated, encrypted link ---------------------------------------------------
+// After connecting, both ends prove they know the pairing key (HMAC-SHA256, fresh random
+// nonces from each side), then every message is one record: u16 length, AES-256-GCM
+// ciphertext, 16-byte tag. One key per direction, nonce = 64-bit message counter, so
+// replayed, reordered or altered records fail the tag check. winvoice's _handshake()
+// is the other half; keep them in step.
+typedef struct {
+    mbedtls_gcm_context tx, rx;
+    uint64_t tx_n, rx_n;
+    uint8_t  buf[96];                        // partly received records from the PC
+    size_t   have;
+} seclink_t;
+static seclink_t s_sec;
+static volatile bool s_auth_failed = false;  // the PC did not know our pairing key (or vice versa)
+
+static void mac33(char tag, const uint8_t *x, const uint8_t *y, uint8_t out[32])
+{
+    uint8_t in[33];
+    in[0] = (uint8_t)tag;
+    memcpy(in + 1, x, 16);
+    memcpy(in + 17, y, 16);
+    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                    (const uint8_t *)s_cfg.psk, strlen(s_cfg.psk), in, sizeof(in), out);
+}
+
+static bool ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
+    return d == 0;
+}
+
+static bool net_recv_all(int fd, uint8_t *buf, size_t n, int timeout_ms)
+{
+    size_t got = 0;
+    TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (got < n) {
+        int32_t left = (int32_t)(end - xTaskGetTickCount());
+        if (left <= 0) return false;
+        int r = net_recv(fd, buf + got, n - got, (int)(left * portTICK_PERIOD_MS));
+        if (r < 0) return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static bool sec_handshake(int sock)
+{
+    mbedtls_gcm_free(&s_sec.tx);
+    mbedtls_gcm_free(&s_sec.rx);
+    memset(&s_sec, 0, sizeof(s_sec));
+    mbedtls_gcm_init(&s_sec.tx);
+    mbedtls_gcm_init(&s_sec.rx);
+
+    uint8_t ns[16], resp[48], want[32], mac_s[32], k[32];
+    esp_fill_random(ns, sizeof(ns));
+    if (!net_send(sock, ns, sizeof(ns))) return false;
+    if (!net_recv_all(sock, resp, sizeof(resp), 5000)) { ESP_LOGW(WTAG, "no answer to the handshake"); return false; }
+    mac33('P', ns, resp, want);                // resp = np (16) + the PC's proof (32)
+    if (!ct_equal(want, resp + 16, 32)) {
+        ESP_LOGW(WTAG, "the PC does not know our pairing key");
+        s_auth_failed = true;
+        return false;
+    }
+    mac33('S', resp, ns, mac_s);
+    if (!net_send(sock, mac_s, sizeof(mac_s))) return false;
+    mac33('1', ns, resp, k);
+    if (mbedtls_gcm_setkey(&s_sec.tx, MBEDTLS_CIPHER_ID_AES, k, 256) != 0) return false;
+    mac33('2', ns, resp, k);
+    if (mbedtls_gcm_setkey(&s_sec.rx, MBEDTLS_CIPHER_ID_AES, k, 256) != 0) return false;
+    memset(k, 0, sizeof(k));
+    s_auth_failed = false;
+    return true;
+}
+
 static bool send_frame(int sock, const uint8_t *f, size_t n)
 {
-    uint8_t buf[2 + FRAME_LEN];
-    buf[0] = n & 0xFF; buf[1] = n >> 8;
-    memcpy(buf + 2, f, n);
-    return net_send(sock, buf, n + 2);
+    uint8_t out[2 + FRAME_LEN + 16];
+    if (n > FRAME_LEN) return false;
+    uint16_t cl = (uint16_t)(n + 16);
+    out[0] = cl & 0xFF; out[1] = cl >> 8;
+    uint8_t iv[12] = {0};
+    memcpy(iv, &s_sec.tx_n, 8);                // the ESP32-S3 is little-endian
+    if (mbedtls_gcm_crypt_and_tag(&s_sec.tx, MBEDTLS_GCM_ENCRYPT, n, iv, sizeof(iv), out, 2,
+                                  f, out + 2, 16, out + 2 + n) != 0) return false;
+    s_sec.tx_n++;
+    return net_send(sock, out, 2 + cl);
 }
 
 static void set_ctrl(uint8_t st)
@@ -438,18 +524,29 @@ static void set_ctrl(uint8_t st)
 // Reads whatever the PC sent; false when the connection is gone.
 static bool poll_ctrl(int sock, int timeout_ms)
 {
-    static uint8_t acc[4];
-    static int have = 0;
-    uint8_t buf[64];
-    int n = net_recv(sock, buf, sizeof(buf), timeout_ms);
-    if (n < 0) { have = 0; return false; }
-    for (int i = 0; i < n; i++) {
-        if (have == 0 && buf[i] != 'C') continue;  // resync on the marker
-        acc[have++] = buf[i];
-        if (have < 4) continue;
-        have = 0;
-        uint8_t st = acc[1];
-        uint16_t sess = acc[2] | (acc[3] << 8);
+    int n = net_recv(sock, s_sec.buf + s_sec.have, sizeof(s_sec.buf) - s_sec.have, timeout_ms);
+    if (n < 0) return false;
+    s_sec.have += (size_t)n;
+    for (;;) {                                 // one record = u16 length + ciphertext + tag
+        if (s_sec.have < 2) break;
+        size_t cl = s_sec.buf[0] | (s_sec.buf[1] << 8);
+        if (cl < 16 + 4 || cl > sizeof(s_sec.buf) - 2) return false;   // not something the PC sends
+        if (s_sec.have < 2 + cl) break;
+        uint8_t iv[12] = {0}, pt[8];
+        memcpy(iv, &s_sec.rx_n, 8);
+        size_t pl = cl - 16;
+        if (pl > sizeof(pt) ||
+            mbedtls_gcm_auth_decrypt(&s_sec.rx, pl, iv, sizeof(iv), s_sec.buf, 2,
+                                     s_sec.buf + 2 + pl, 16, s_sec.buf + 2, pt) != 0) {
+            ESP_LOGW(WTAG, "a record from the PC failed authentication");
+            return false;
+        }
+        s_sec.rx_n++;
+        memmove(s_sec.buf, s_sec.buf + 2 + cl, s_sec.have - (2 + cl));
+        s_sec.have -= 2 + cl;
+        if (pl != 4 || pt[0] != 'C') continue;
+        uint8_t st = pt[1];
+        uint16_t sess = pt[2] | (pt[3] << 8);
         s_last_ping = xTaskGetTickCount();
         if (st == CTRL_PING) continue;
         if (sess == 0 || sess == s_session) set_ctrl(st);
@@ -513,7 +610,16 @@ static void link_loop(void)
             if (sock < 0) {
                 s_base = WIFIMIC_UI_PEER;
                 sock = net_connect(s_cfg.host, s_cfg.port, 5000);
-                if (sock >= 0) { ESP_LOGI(WTAG, "connected to %s:%u", s_cfg.host, (unsigned)s_cfg.port); s_last_ping = 0; }
+                if (sock >= 0) {
+                    if (sec_handshake(sock)) {
+                        ESP_LOGI(WTAG, "connected to %s:%u, pairing key accepted", s_cfg.host, (unsigned)s_cfg.port);
+                        s_last_ping = 0;
+                    } else {
+                        close(sock);
+                        sock = -1;
+                        vTaskDelay(pdMS_TO_TICKS(3000));   // do not hammer a PC that refuses us
+                    }
+                }
             }
             if (sock >= 0) {
                 bool alive = poll_ctrl(sock, 50);   // short: a button press starts recording within 50 ms
@@ -607,10 +713,11 @@ void wifimic_detail(char *a, size_t an, char *b, size_t bn)
     case WIFIMIC_UI_TAILNET:
     case WIFIMIC_UI_PEER:
         snprintf(a, an, "%s", s_cfg.host);
+        if (s_auth_failed) snprintf(b, bn, "KEY MISMATCH");   // no new Chinese glyphs needed
         break;
     default:
         snprintf(a, an, "%s", s_cfg.host);
-        snprintf(b, bn, "LAN");
+        snprintf(b, bn, "LAN AES");
         break;
     }
 }

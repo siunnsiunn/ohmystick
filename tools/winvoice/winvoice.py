@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 import array
 import configparser
+import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -76,7 +78,8 @@ DEFAULTS = {
     "log_text": "false",
     "timeout": "30",
     "wifi_port": "47100",
-    "wifi_allow": "100.64.0.0/10",
+    "wifi_allow": "192.168.0.0/16, 100.64.0.0/10",
+    "wifi_key": "",
 }
 
 
@@ -111,6 +114,7 @@ class Config:
         self.wifi_port = s.getint("wifi_port")
         self.wifi_allow = [ipaddress.ip_network(n.strip(), strict=False)
                            for n in s.get("wifi_allow").split(",") if n.strip()]
+        self.wifi_key = s.get("wifi_key").strip()
         if self.backend == "short":
             # The short-audio API rejects anything over 60 s.
             self.max_seconds = min(self.max_seconds, 58)
@@ -423,6 +427,13 @@ def adpcm_decode(data: bytes, pred: int, idx: int) -> bytes:
     return out.tobytes()
 
 
+WIFI_KEY_MIN = 12
+
+
+def _wifi_mac(psk: bytes, tag: bytes, x: bytes, y: bytes) -> bytes:
+    return hmac.new(psk, tag + x + y, hashlib.sha256).digest()
+
+
 def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
     buf = b""
     while len(buf) < n:
@@ -442,6 +453,14 @@ class StickServer:
         self.on_recording = on_recording
 
     def start(self) -> None:
+        if len(self.cfg.wifi_key.encode()) < WIFI_KEY_MIN:
+            raise ValueError(f"wifi_key in winvoice.ini must be at least {WIFI_KEY_MIN} characters "
+                             "(make one with: py -c \"import secrets;print(secrets.token_hex(10))\")")
+        try:
+            import cryptography  # noqa: F401
+        except ImportError:
+            raise ValueError("the network receiver needs the 'cryptography' package: "
+                             "py -m pip install cryptography") from None
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", self.cfg.wifi_port))
@@ -463,15 +482,52 @@ class StickServer:
             log.info("stick connected from %s", ip)
             threading.Thread(target=self._serve, args=(conn, ip), daemon=True).start()
 
+    def _handshake(self, conn: socket.socket):
+        """Mutual proof that both ends know wifi_key, then one key per direction.
+        stick -> PC: ns (16 random bytes)
+        PC -> stick: np (16 random) + HMAC(key, 'P' ns np)
+        stick -> PC: HMAC(key, 'S' np ns)
+        Returns (key stick->PC, key PC->stick), or None when the stick fails the check."""
+        psk = self.cfg.wifi_key.encode()
+        conn.settimeout(5)
+        ns = _recv_exact(conn, 16)
+        if ns is None:
+            return None
+        np_ = os.urandom(16)
+        conn.sendall(np_ + _wifi_mac(psk, b"P", ns, np_))
+        got = _recv_exact(conn, 32)
+        if got is None or not hmac.compare_digest(got, _wifi_mac(psk, b"S", np_, ns)):
+            return None
+        return _wifi_mac(psk, b"1", ns, np_), _wifi_mac(psk, b"2", ns, np_)
+
     def _serve(self, conn: socket.socket, ip: str) -> None:
+        from cryptography.exceptions import InvalidTag
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        try:
+            keys = self._handshake(conn)
+        except OSError as e:
+            log.info("handshake with %s failed: %s", ip, e)
+            keys = None
+        if keys is None:
+            log.warning("refused %s: it did not prove it knows wifi_key (wrong key on the stick?)", ip)
+            conn.close()
+            return
+        log.info("stick at %s passed the pairing-key check", ip)
+        rx, tx = AESGCM(keys[0]), AESGCM(keys[1])
+        rx_n = 0
+        tx_n = 0
         lock = threading.Lock()
         alive = threading.Event()
         alive.set()
 
         def send_ctrl(status: int, session: int) -> None:
+            nonlocal tx_n
             try:
                 with lock:
-                    conn.sendall(b"C" + bytes([status, session & 0xFF, (session >> 8) & 0xFF]))
+                    hdr = struct.pack("<H", 4 + 16)
+                    msg = b"C" + bytes([status, session & 0xFF, (session >> 8) & 0xFF])
+                    conn.sendall(hdr + tx.encrypt(struct.pack("<QI", tx_n, 0), msg, hdr))
+                    tx_n += 1
             except OSError:
                 alive.clear()
 
@@ -492,8 +548,19 @@ class StickServer:
                 if head is None:
                     break
                 n = head[0] | head[1] << 8
-                frame = _recv_exact(conn, n) if n else b""
-                if frame is None or len(frame) < 12:
+                if n < 16 + 12 or n > 16 + 12 + 160 + 8:   # nothing the stick sends is outside this
+                    log.warning("bad record length %d from %s", n, ip)
+                    break
+                body = _recv_exact(conn, n)
+                if body is None:
+                    break
+                try:
+                    frame = rx.decrypt(struct.pack("<QI", rx_n, 0), body, head)
+                except InvalidTag:
+                    log.warning("record from %s failed authentication; closing", ip)
+                    break
+                rx_n += 1
+                if len(frame) < 12:
                     break
                 ver, ftype, sess, seq, codec, flags, pred, idx = struct.unpack_from("<BBHHBBhB", frame)
                 if ftype == FRAME_START:
@@ -818,6 +885,8 @@ class App:
         if self.cfg.wifi_port:
             try:
                 StickServer(self.cfg, self.on_stick_recording).start()
+            except ValueError as e:
+                log.warning("network receiver for the stick is off: %s", e)
             except OSError as e:
                 log.error("cannot listen on TCP port %d for the stick: %s", self.cfg.wifi_port, e)
         self.notify("ready")
@@ -865,7 +934,11 @@ def wifi_test(cfg: Config) -> int:
               f"peak {pcm_peak(pcm)} -> {name}", flush=True)
         reply(CTRL_DONE)
 
-    StickServer(cfg, got).start()
+    try:
+        StickServer(cfg, got).start()
+    except ValueError as e:
+        print(f"Cannot start: {e}")
+        return 1
     print(f"Waiting for the stick on TCP port {port}. Hold its front button and talk; Ctrl+C quits.")
     try:
         while True:
