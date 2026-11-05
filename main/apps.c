@@ -154,11 +154,18 @@ static uint32_t wifi_tick(bool first)
 }
 static int  wifi_activity(void)          { return (int)wifimic_ui_state(); }
 static void wifi_enter(void)             { wifimic_enter(); }
-static void wifi_front_down(void)        { wifimic_start(); }
+// One tap starts, the next tap stops and sends (like Ctrl+F12 with the USB microphone).
+static bool s_wifi_tap_stopped = false;       // this press ended a recording; it is not a long press
+static void wifi_front_down(void)
+{
+    s_wifi_tap_stopped = false;
+    if (wifimic_recording()) { wifimic_stop(); s_wifi_tap_stopped = true; }
+    else wifimic_start();
+}
 static void wifi_front_up(uint32_t held, bool is_long)
 {
     (void)is_long;
-    if (wifimic_recording()) { wifimic_stop(); return; }
+    if (s_wifi_tap_stopped || wifimic_recording()) return;
     wifimic_ui_t ui = wifimic_ui_state();
     // No link (or a fresh stick): holding the front button for 3 s opens the setup hotspot.
     if (held >= 3000 && ui != WIFIMIC_UI_READY && ui != WIFIMIC_UI_BUSY && ui != WIFIMIC_UI_SETUP)

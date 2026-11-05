@@ -12,7 +12,7 @@
 |---|---|---|
 | `bootloader.bin` | `0x0` | `01ff8d7066155330d2b38645cd7690d79b6081896afde4b9d7160ae7a9c1ec90` |
 | `partition-table.bin` | `0x8000` | `5295e8c42d6fb5f95e4e8a185932c6191d27cfc5078322475347e40e71af815a` |
-| `voxstick.bin` | `0x10000` | `7a69efc2d97ae32b969be51c54d3189c08f934eca5ba6a8226f2756e263c576b` |
+| `voxstick.bin` | `0x10000` | `8ef2237b4a478bfbabddbb39253d42aa7c1f6a78cbd730ff14c91493bc0df867` |
 
 ## 刷入（Windows）
 
@@ -46,7 +46,7 @@ py -m esptool --chip esp32s3 -b 460800 write_flash 0x0 bootloader.bin 0x8000 par
    按「儲存並重新開機」。Stage T 留下的 Tailscale auth key 會在這時從 Stick 裡刪掉。
 7. 重開後進「Wi-Fi 聽寫」。畫面依序：連線中（Wi-Fi）→ 未連線（找電腦）→ 可錄音，下方顯示 `LAN AES`。
    - 如果停在「未連線」且下方出現 `KEY MISMATCH`：Stick 和電腦的配對密碼不一樣，回設定頁（長按前鍵 3 秒）重填。
-8. 按住前鍵說一句測試用的話、放開；電腦印出秒數、幀數、遺失數並存成 `wifi-test-<編號>.wav`，Stick 顯示「完成」。
+8. **單擊前鍵開始錄音、說話、再單擊一下停止並送出**（和 USB 聽寫的 Ctrl+F12 一樣）。Stick 平放在桌上時按前鍵不會錄音，只會嗶兩聲；電腦印出秒數、幀數、遺失數並存成 `wifi-test-<編號>.wav`，Stick 顯示「完成」。
 
 ## 回報
 

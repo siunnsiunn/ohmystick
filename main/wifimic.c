@@ -695,6 +695,8 @@ wifimic_ui_t wifimic_ui_state(void)
 bool wifimic_start(void)
 {
     if (s_base != WIFIMIC_UI_READY || s_recording) return false;
+    // Lying flat = not listening (same rule as the USB microphone, when flat-mute is on).
+    if (vox_config_flat_mute_enabled() && g_imu_mute) { beep_play(2); return false; }
     s_recording = true;
     return true;
 }
