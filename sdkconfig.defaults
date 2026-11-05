@@ -67,6 +67,3 @@ CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
-# MicroLink's own web config page would expose the tailnet settings on the VPN address;
-# the WIFI app has its own setup hotspot instead.
-CONFIG_ML_ENABLE_CONFIG_HTTPD=n

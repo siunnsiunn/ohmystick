@@ -3,6 +3,7 @@
 #include "wifimic.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -12,13 +13,14 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
-#include "microlink.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
 #include "nvs.h"
 
 // =========================================================================
-// WIFI — WHISPER over Wi-Fi + Tailscale (docs/WIFI-PLAN.md, stage T).
+// WIFI — WHISPER over Wi-Fi, direct TCP on the local network (docs/WIFI-PLAN.md, appendix).
 //
-// Settings (Wi-Fi name and password, Tailscale auth key, PC address) are typed on a
+// Settings (Wi-Fi name and password, pairing key, PC address on the LAN) are typed on a
 // phone: with nothing saved the stick opens a WPA2 hotspot whose password is shown on
 // the screen, and serves a form at 192.168.4.1. Saving reboots the stick.
 //
@@ -45,8 +47,8 @@ enum { CTRL_BUSY = 1, CTRL_DONE = 2, CTRL_ERR = 3, CTRL_PING = 5 };
 typedef struct {
     char     ssid[33];
     char     pass[65];
-    char     key[128];                       // tskey-auth-...
-    char     host[64];                       // PC: 100.x.y.z or its MagicDNS name
+    char     key[128];                       // pairing key (unused until the encryption step)
+    char     host[64];                       // PC: LAN IPv4 address or host name
     uint16_t port;
 } wcfg_t;
 
@@ -54,13 +56,11 @@ static wcfg_t            s_cfg;
 static TaskHandle_t      s_task = NULL;
 static EventGroupHandle_t s_ev = NULL;
 #define EV_GOT_IP        BIT0
-static microlink_t      *s_ml = NULL;
 static volatile wifimic_ui_t s_base = WIFIMIC_UI_OFF;   // link state, set by the task
 static volatile bool     s_recording = false;
 static volatile uint8_t  s_ctrl = 0;
 static volatile TickType_t s_ctrl_until = 0;
 static volatile TickType_t s_last_ping = 0;
-static volatile bool     s_direct = false;
 static uint16_t          s_session = 0;
 static char              s_ap_ssid[33];
 static char              s_ap_pass[9];
@@ -89,7 +89,7 @@ static bool cfg_load(void)
     uint16_t port;
     if (nvs_get_u16(h, "port", &port) == ESP_OK && port) s_cfg.port = port;
     nvs_close(h);
-    return s_cfg.ssid[0] && s_cfg.key[0] && s_cfg.host[0];
+    return s_cfg.ssid[0] && s_cfg.host[0];
 }
 
 static bool setup_flag(bool clear)
@@ -247,9 +247,9 @@ static esp_err_t form_get(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "<input type=hidden name=_ value=\"");
     httpd_resp_sendstr_chunk(req, "\"><label>Wi-Fi 密碼</label><input name=pass type=password>"
         "<small>留空 = 沿用已存的密碼</small>"
-        "<label>Tailscale auth key</label><input name=key placeholder=tskey-auth-...>"
-        "<small>留空 = 沿用已存的金鑰</small>"
-        "<label>電腦的 Tailscale 位址</label><input name=host placeholder=100.x.y.z value=\"");
+        "<label>配對密碼（加密用，目前可留空）</label><input name=key>"
+        "<small>留空 = 沿用已存的密碼</small>"
+        "<label>電腦的區網位址</label><input name=host placeholder=192.168.1.x value=\"");
     html_escape(req, s_cfg.host);
     httpd_resp_sendstr_chunk(req, "\"><label>winvoice 埠號</label><input name=port inputmode=numeric value=\"");
     httpd_resp_sendstr_chunk(req, port);
@@ -364,12 +364,69 @@ static void fill_header(uint8_t *f, uint8_t type, uint16_t seq, int pred, int id
     f[8] = p & 0xFF; f[9] = p >> 8; f[10] = (uint8_t)idx;
 }
 
-static bool send_frame(microlink_tcp_socket_t *sock, const uint8_t *f, size_t n)
+// ---- TCP to winvoice (plain lwIP sockets; the encryption step wraps these) ----------
+static int net_connect(const char *host, uint16_t port, int timeout_ms)
+{
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    char ps[8];
+    snprintf(ps, sizeof(ps), "%u", (unsigned)port);
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return -1;
+    int fd = socket(res->ai_family, res->ai_socktype, 0);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc < 0 && errno == EINPROGRESS) {
+        fd_set wf;
+        FD_ZERO(&wf); FD_SET(fd, &wf);
+        struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+        int err = 0;
+        socklen_t el = sizeof(err);
+        if (select(fd + 1, NULL, &wf, NULL, &tv) > 0 &&
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0) rc = 0;
+        else { if (err) ESP_LOGW(WTAG, "connect failed, errno %d", err); rc = -1; }
+    }
+    if (rc < 0) { close(fd); return -1; }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return fd;
+}
+
+static bool net_send(int fd, const uint8_t *p, size_t n)
+{
+    while (n) {
+        int w = send(fd, p, n, 0);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+            return false;
+        }
+        p += w; n -= (size_t)w;
+    }
+    return true;
+}
+
+// >0 bytes read, 0 nothing within the timeout, -1 connection closed or broken.
+static int net_recv(int fd, uint8_t *buf, size_t n, int timeout_ms)
+{
+    fd_set rf;
+    FD_ZERO(&rf); FD_SET(fd, &rf);
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+    int s = select(fd + 1, &rf, NULL, NULL, &tv);
+    if (s < 0) return -1;
+    if (s == 0) return 0;
+    int r = recv(fd, buf, n, 0);
+    if (r > 0) return r;
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    return -1;                                 // 0 = the PC closed the connection
+}
+
+static bool send_frame(int sock, const uint8_t *f, size_t n)
 {
     uint8_t buf[2 + FRAME_LEN];
     buf[0] = n & 0xFF; buf[1] = n >> 8;
     memcpy(buf + 2, f, n);
-    return microlink_tcp_send(sock, buf, n + 2) == ESP_OK;
+    return net_send(sock, buf, n + 2);
 }
 
 static void set_ctrl(uint8_t st)
@@ -379,12 +436,12 @@ static void set_ctrl(uint8_t st)
 }
 
 // Reads whatever the PC sent; false when the connection is gone.
-static bool poll_ctrl(microlink_tcp_socket_t *sock, int timeout_ms)
+static bool poll_ctrl(int sock, int timeout_ms)
 {
     static uint8_t acc[4];
     static int have = 0;
     uint8_t buf[64];
-    int n = microlink_tcp_recv(sock, buf, sizeof(buf), timeout_ms);
+    int n = net_recv(sock, buf, sizeof(buf), timeout_ms);
     if (n < 0) { have = 0; return false; }
     for (int i = 0; i < n; i++) {
         if (have == 0 && buf[i] != 'C') continue;  // resync on the marker
@@ -406,7 +463,7 @@ static bool peer_alive(void)
            (int32_t)(xTaskGetTickCount() - s_last_ping) < (int32_t)pdMS_TO_TICKS(PEER_ALIVE_MS);
 }
 
-static bool record_session(microlink_tcp_socket_t *sock)
+static bool record_session(int sock)
 {
     static int16_t pcm[SAMPLES_PER_FRAME];
     uint8_t frame[FRAME_LEN];
@@ -442,72 +499,38 @@ static bool record_session(microlink_tcp_socket_t *sock)
     return ok;
 }
 
-static void refresh_direct(uint32_t host_ip)
-{
-    int n = microlink_get_peer_count(s_ml);
-    for (int i = 0; i < n; i++) {
-        microlink_peer_info_t info;
-        if (microlink_get_peer_info(s_ml, i, &info) == ESP_OK && info.vpn_ip == host_ip) {
-            s_direct = info.direct_path;
-            return;
-        }
-    }
-}
-
 static void link_loop(void)
 {
     s_base = WIFIMIC_UI_WIFI;
     while (!(xEventGroupWaitBits(s_ev, EV_GOT_IP, pdFALSE, pdTRUE, pdMS_TO_TICKS(1000)) & EV_GOT_IP)) {}
 
-    microlink_config_t mc = {
-        .auth_key = s_cfg.key,
-        .device_name = "ohmystick",
-        .enable_derp = true,
-        .enable_stun = true,
-        .enable_disco = true,
-        .max_peers = 8,
-    };
-    s_ml = microlink_init(&mc);
-    if (!s_ml || microlink_start(s_ml) != ESP_OK) {
-        ESP_LOGE(WTAG, "microlink failed to start");
-        s_base = WIFIMIC_UI_TAILNET;
-        return;
-    }
-
-    microlink_tcp_socket_t *sock = NULL;
-    uint32_t host_ip = 0;
+    int sock = -1;
     for (;;) {
         if (!(xEventGroupGetBits(s_ev) & EV_GOT_IP)) {
             s_base = WIFIMIC_UI_WIFI;
-        } else if (!microlink_is_connected(s_ml)) {
-            s_base = WIFIMIC_UI_TAILNET;
+            if (sock >= 0) { close(sock); sock = -1; s_last_ping = 0; }
         } else {
-            if (!host_ip) {
-                host_ip = microlink_parse_ip(s_cfg.host);
-                if (!host_ip) host_ip = microlink_resolve(s_ml, s_cfg.host);   // MagicDNS name
-            }
-            if (host_ip && !sock) {
+            if (sock < 0) {
                 s_base = WIFIMIC_UI_PEER;
-                sock = microlink_tcp_connect(s_ml, host_ip, s_cfg.port, 10000);
-                if (sock) { ESP_LOGI(WTAG, "connected to %s:%u", s_cfg.host, (unsigned)s_cfg.port); s_last_ping = 0; }
+                sock = net_connect(s_cfg.host, s_cfg.port, 5000);
+                if (sock >= 0) { ESP_LOGI(WTAG, "connected to %s:%u", s_cfg.host, (unsigned)s_cfg.port); s_last_ping = 0; }
             }
-            if (sock) {
-                refresh_direct(host_ip);
+            if (sock >= 0) {
                 bool alive = poll_ctrl(sock, 50);   // short: a button press starts recording within 50 ms
                 if (alive && s_recording) alive = record_session(sock);
                 if (alive && s_last_ping != 0 && !peer_alive()) alive = false;   // PC went quiet
                 if (!alive) {
                     ESP_LOGW(WTAG, "link to the PC lost");
-                    microlink_tcp_close(sock);
-                    sock = NULL;
+                    close(sock);
+                    sock = -1;
                     s_last_ping = 0;
                     if (s_recording) { s_recording = false; set_ctrl(CTRL_ERR); }
                 }
-                s_base = (sock && peer_alive()) ? WIFIMIC_UI_READY : WIFIMIC_UI_PEER;
+                s_base = (sock >= 0 && peer_alive()) ? WIFIMIC_UI_READY : WIFIMIC_UI_PEER;
                 continue;                      // poll_ctrl already waited
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(sock ? 50 : 1000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -587,7 +610,7 @@ void wifimic_detail(char *a, size_t an, char *b, size_t bn)
         break;
     default:
         snprintf(a, an, "%s", s_cfg.host);
-        snprintf(b, bn, "%s", s_direct ? "DIRECT" : "RELAY");
+        snprintf(b, bn, "LAN");
         break;
     }
 }
