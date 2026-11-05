@@ -97,6 +97,7 @@ static const char *TAG __attribute__((unused)) = "voxstick";
 #define I2S_BCLK_PIN  17
 #define I2S_WS_PIN    15
 #define I2S_DIN_PIN   16
+#define I2S_DOUT_PIN  14
 
 // StickS3 face button. BtnA = front, big M5 logo. BtnB header is unpopulated
 // on this hardware revision so we don't bother polling it.
@@ -161,6 +162,10 @@ static const char *TAG __attribute__((unused)) = "voxstick";
 void app_main(void);
 extern vox_config_wire_t g_press_cfg;
 extern const app_t app_timer;
+void codec_mic_regs(void);
+extern volatile int g_beep_dbg;   // 0 never, 1 codec not ready, 2 tx channel failed, 3 enable failed, 4 played
+void beep_play(int count);        // short beeps on the speaker (runs in its own task)
+void pmic_speaker(bool on);       // speaker amplifier enable
 extern volatile uint32_t g_imu_flips;
 extern const app_t app_slide;
 const app_t *launcher_app(int i);

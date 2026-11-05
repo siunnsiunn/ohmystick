@@ -12,7 +12,7 @@ void icon_diag(int x, int y, uint16_t fg, uint16_t bg)      // warning triangle 
     lcd_fill_rect(x + 13, y + 20, x + 16, y + 23, fg);
 }
 
-#define DIAG_LINES 14
+#define DIAG_LINES 15
 static char g_diag_shown[DIAG_LINES][48];
 
 // Redraws one 9 px line only if its text changed.
@@ -72,6 +72,8 @@ static uint32_t diag_tick_details(bool first)
         diag_line(8, "LAST RESET NONE", COL_GREEN);
         pmic_regs_text(s, sizeof(s));
         diag_line(9, s, COL_LIGHT_GRAY);
+        snprintf(s, sizeof(s), "BEEP %d", g_beep_dbg);
+        diag_line(14, s, COL_LIGHT_GRAY);
         diag_line(13, "FRONT BACK  HOLD PAIR", COL_LIGHT_GRAY);
     }
     return 1000;

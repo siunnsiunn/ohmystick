@@ -16,7 +16,7 @@ The menu is a two-column grid, all six apps on one page. The **side button** mov
 | **WHISPER** (live dictation) | Hold the front button and talk; audio streams over BLE to a Mac helper, local Whisper transcribes it, the text is pasted at the cursor |
 | **NOTE** (voice notes) | Same, but works with no Mac nearby: recordings go to the stick's flash (12 slots, 30 s each) and upload automatically when you are back on the NOTE screen with the Mac helper running. The text goes to an inbox and is not pasted |
 | **SLIDE** | Bluetooth slide clicker: front = next, side = previous |
-| **TIMER** | Hourglass countdown: side button picks 1/3/5/10/15/30 min, front button starts and pauses; the screen blinks when time is up (no sound) |
+| **TIMER** | Hourglass countdown: side button picks 1/3/5/10/15/30 min, front button starts and pauses; turning the stick over also starts it; when time is up the screen blinks and it chimes three times softly |
 | **Status** (DIAG) | A plain-language status page: link, pending notes, battery, whether the stick restarted itself, and the pairing entry |
 
 USB MIC, SLIDE and TIMER use **hold the front button for about 2.5 s** to return to the menu.

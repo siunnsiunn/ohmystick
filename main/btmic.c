@@ -155,6 +155,9 @@ static const struct ble_gatt_svc_def k_svcs[] = {
                 .val_handle = &s_audio_handle,
                 .flags = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ_ENC
 #if !VOX_BLE_JUST_WORKS
+#ifndef BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN
+#error "ESP-IDF 5.5.1 or newer is needed: older NimBLE cannot require an authenticated link to subscribe"
+#endif
                          | BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN        // subscribing needs an authenticated link
 #endif
                          ,

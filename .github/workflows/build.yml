@@ -28,10 +28,10 @@ jobs:
             dependencies.lock
           key: ${{ runner.os }}-idf-components-${{ hashFiles('main/idf_component.yml') }}
 
-      - name: Build firmware (ESP-IDF v5.5)
+      - name: Build firmware (ESP-IDF v5.5.1)
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.5
+          esp_idf_version: v5.5.1
           target: esp32s3
           path: '.'
 
