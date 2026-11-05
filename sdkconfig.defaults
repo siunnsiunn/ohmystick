@@ -51,10 +51,10 @@ CONFIG_ESP_TASK_WDT_EN=y
 CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 
-# --- Wi-Fi + Tailscale (WIFI app, MicroLink in third_party/microlink) -----------------
-# Settings from MicroLink's basic_connect example that the tunnel needs: the Noise
-# handshake uses ChaCha20-Poly1305 and HKDF, the control plane is HTTPS (TLS 1.2 with
-# the common CA bundle), and WireGuard wants a few more lwIP sockets and mailbox slots.
+# --- Wi-Fi (WIFI app) ------------------------------------------------------------------
+# These came in with the Tailscale client of stage T (ChaCha20-Poly1305, HKDF, the CA bundle,
+# more lwIP sockets and mailbox slots). The LAN version does not need them, but they are kept so
+# the image that was tested in the clinic stays as it was; trim them in a separate, tested change.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_LWIP_SO_RCVBUF=y

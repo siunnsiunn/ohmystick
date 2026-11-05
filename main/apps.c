@@ -131,7 +131,7 @@ static void voice_front_up(uint32_t held, bool is_long) { (void)held; (void)is_l
 static void voice_side_down(void)        { if (!btmic_recording()) enter_app(NULL); }
 
 
-// ---- WIFI: WHISPER over Wi-Fi + Tailscale (wifimic.c) -----------------------------
+// ---- WIFI: WHISPER over Wi-Fi on the local network (wifimic.c) -----------------------------
 static void icon_wifi(int x, int y, uint16_t fg, uint16_t bg)       // three arcs over a dot
 {
     (void)bg;

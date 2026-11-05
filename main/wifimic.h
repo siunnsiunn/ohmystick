@@ -1,7 +1,8 @@
 #pragma once
-// WIFI: the WHISPER flow over Wi-Fi and Tailscale instead of BLE (docs/WIFI-PLAN.md).
-// The stick joins the tailnet with MicroLink, opens a TCP connection to winvoice on the
-// PC and sends the same frames as docs/BT-MIC.md, each prefixed with its length.
+// WIFI: the WHISPER flow over Wi-Fi instead of BLE (docs/WIFI-PLAN.md).
+// The stick joins the Wi-Fi network, opens a TCP connection to winvoice on the PC, proves it knows
+// the pairing key and encrypts everything after that. It sends the same frames as
+// docs/BT-MIC.md, each prefixed with its length.
 #include <stdbool.h>
 #include <stddef.h>
 
