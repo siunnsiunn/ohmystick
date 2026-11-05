@@ -628,7 +628,12 @@ static void link_loop(void)
             }
             if (sock >= 0) {
                 bool alive = poll_ctrl(sock, 50);   // short: a button press starts recording within 50 ms
-                if (alive && s_recording) alive = record_session(sock);
+                if (alive && s_recording) {
+                    alive = record_session(sock);
+                    // PINGs are not read while recording, so after a long take the last one looks
+                    // ancient; the send just worked, so the link is fine. Start the clock again.
+                    if (alive) s_last_ping = xTaskGetTickCount();
+                }
                 if (alive && s_last_ping != 0 && !peer_alive()) alive = false;   // PC went quiet
                 if (!alive) {
                     ESP_LOGW(WTAG, "link to the PC lost");

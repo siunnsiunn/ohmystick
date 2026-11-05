@@ -12,7 +12,7 @@
 |---|---|---|
 | `bootloader.bin` | `0x0` | `01ff8d7066155330d2b38645cd7690d79b6081896afde4b9d7160ae7a9c1ec90` |
 | `partition-table.bin` | `0x8000` | `5295e8c42d6fb5f95e4e8a185932c6191d27cfc5078322475347e40e71af815a` |
-| `voxstick.bin` | `0x10000` | `adcd7b2824c44dfdd50f41e651f490ebc5239f60b9f015424fd43b9579c7f932` |
+| `voxstick.bin` | `0x10000` | `80965fc3b07d78b2a24db9e440948a513ef19b22b40a01125636187b17f29502` |
 
 ## 刷入（Windows）
 
