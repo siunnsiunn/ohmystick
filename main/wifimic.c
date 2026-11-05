@@ -580,6 +580,10 @@ static bool record_session(int sock)
     while (ok && s_recording && seq < MAX_FRAMES) {
         int n = btmic_pcm_read(pcm, SAMPLES_PER_FRAME);
         if (n < 0) { ESP_LOGW(WTAG, "mic read failed"); break; }
+        // Same rule as the USB microphone: lying flat on the table = muted (when the flat-mute
+        // setting is on), so a stick left on the desk does not dictate by accident. winvoice
+        // sees a silent take and answers with an error instead of sending it to the cloud.
+        if (vox_config_flat_mute_enabled() && g_imu_mute) memset(pcm, 0, sizeof(pcm));
         for (int i = n; i < SAMPLES_PER_FRAME; i++) pcm[i] = 0;
         int pred0 = st.pred, idx0 = st.idx;
         uint8_t *data = frame + HEADER_LEN;
