@@ -5,6 +5,13 @@
 
 > **這一版的連線沒有加密。** 只用來確認「區網直連」走得通，**請只說測試用的句子，不要錄病患的語音**。
 > 加密（階段 L2）完成前，不要拿它做正式聽寫。
+>
+> **連線也沒有驗證身分。** winvoice 只用 IP 範圍（`wifi_allow`）擋人，區網內任何裝置都連得到 47100 埠。
+> 一般模式（`py winvoice.py`）會把收到的錄音辨識後貼到游標處，等於區網裡的人可以把文字塞進你正在用的欄位。
+> 所以：
+> - 測試只用 `py winvoice.py --wifi-test`（只存 WAV，不辨識、不貼上），測完就結束它。
+> - 平常用 USB 聽寫時，把 `winvoice.ini` 的 `wifi_port` 設成 `0` 關掉網路接收，並把 `wifi_allow` 改回預設。
+> - 防火牆規則測完就刪：`netsh advfirewall firewall delete rule name="winvoice lan"`。
 
 | 檔案 | 位址 | SHA-256 |
 |---|---|---|
