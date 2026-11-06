@@ -84,7 +84,7 @@ Stick 到主機：
 {
   "hooks": {
     "PermissionRequest": [
-      { "hooks": [ { "type": "command", "command": "STICK_DEV=/dev/cu.usbmodemXXXX /Users/Jung/Documents/1_專案/工具開發/stick/claude-approval-stick/hook/permission_request.sh", "timeout": 40 } ] }
+      { "hooks": [ { "type": "command", "command": "STICK_DEV=/dev/cu.usbmodemXXXX /path/to/securestick/tools/claude-approval-stick/hook/permission_request.sh", "timeout": 40 } ] }
     ]
   }
 }
