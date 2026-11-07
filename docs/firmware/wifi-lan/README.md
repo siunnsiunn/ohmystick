@@ -56,3 +56,22 @@ py -m esptool --chip esp32s3 -b 460800 write_flash 0x0 bootloader.bin 0x8000 par
 ## 平常聽寫
 
 winvoice 一般模式（`py winvoice.py`）在有 `wifi_key` 時才會開網路接收；沒填就只用 USB。
+
+## Mac 端（btmic 的網路接收）
+
+Stick 也可以連到 Mac 的 btmic，用 Mac 上的本機 Whisper 辨識後貼到游標處，不經雲端。協定和 winvoice 完全一樣
+（配對密碼互相驗證、AES-256-GCM 加密），Stick 同一時間只連一個目標，**換目標就是回設定頁改「電腦的區網位址」**。
+
+1. **配對密碼**：寫進 `~/.btmic-wifi-key`（只放一行，至少 12 個字元），並 `chmod 600 ~/.btmic-wifi-key`。
+   Stick 只存一組密碼，所以 Mac 和診所電腦要用**同一組**（想分開的話，換目標時順便改 Stick 的配對密碼）。
+   沒有這個檔案（或環境變數 `BTMIC_WIFI_KEY`），btmic 不開網路接收，只走藍牙。
+2. **重新建置並重啟 btmic**：`tools/btmic/build.sh`，再重啟常駐服務（`launchctl kickstart -k gui/$(id -u)/<你的 agent 名稱>`，
+   或結束後重新 `run.sh`）。**注意**：沒有簽章身分（`~/.btmic-sign-id`）時是臨時簽章，輔助使用要重新授權。
+3. 第一次有連線進來時，macOS 會問「是否允許 btmic 接受連入網路連線」，選**允許**。
+4. 查 Mac 的區網位址：`ipconfig getifaddr en0`（Wi-Fi），填進 Stick 設定頁的「電腦的區網位址」，埠號 `47100`
+   （要改埠號用環境變數 `BTMIC_WIFI_PORT`）。
+5. 看 `~/.btmic.log`：`Wi-Fi receiver listening on TCP port 47100` 是已開始監聽，`Wi-Fi: stick at ... passed the pairing-key check` 是 Stick 連上了。
+
+btmic 只接受來自本機、私有區網（10/8、172.16/12、192.168/16）和 Tailscale（100.64/10）的連線，之後還要通過配對密碼才算數。
+
+驗證程式本身（不需要 Stick、藍牙或網路）：`btmic wifi-selftest`，會在本機回送測試握手、加密、錯誤密碼被拒、DONE 回覆。
