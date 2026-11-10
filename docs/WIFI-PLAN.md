@@ -7,7 +7,8 @@
 區網版已在診所實機通過即時聽寫**：連線用配對密碼互相驗證、AES-256-GCM 加密，單擊前鍵開始、再單擊停止並送出，
 平放不收音。設定與刷入步驟在 [`docs/firmware/wifi-lan/README.md`](firmware/wifi-lan/README.md)。
 下文的 Tailscale 架構、階段 1–4 是原本的設計，保留作為決策記錄；實際做法以區網版為準。
-尚未做：階段 3（語音筆記走 Wi-Fi）、階段 4（無線更新）、Mac 端網路接收、設定模式逾時自動關閉。
+Mac 端網路接收（btmic）已寫好並通過 `btmic wifi-selftest`，Stick 對 Mac 的實機測試還沒做（見 `docs/firmware/wifi-lan/README.md` 的 Mac 段）。
+尚未做：階段 3（語音筆記走 Wi-Fi）、階段 4（無線更新）、設定模式逾時自動關閉。
 各階段都要刷到實機上測過才算完成。
 
 ## 背景

@@ -7,6 +7,7 @@
 import AppKit
 import CoreBluetooth
 import ApplicationServices
+import CryptoKit
 import Foundation
 
 // MARK: - IMA ADPCM (16 kHz mono)
@@ -493,6 +494,7 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         self.pressReturn = pressReturn
         super.init()
         central = CBCentralManager(delegate: self, queue: nil)
+        startWifi()
     }
 
     // ---- finding the stick -------------------------------------------------
@@ -604,6 +606,11 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     // ---- receiving ---------------------------------------------------------
     func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
         guard c.uuid == btmicAudio, let data = c.value, let f = parseFrame([UInt8](data)) else { return }
+        handleFrame(f)
+    }
+
+    /// One frame from either transport: a BLE notification or the Wi-Fi link.
+    private func handleFrame(_ f: ParsedFrame) {
         switch f.type {
         case .start:
             begin(session: f.session, firstSeq: 1, offline: f.flags & flagOffline != 0)
@@ -722,10 +729,273 @@ final class Listener: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     /// Status goes with the recording's session number so a stick that is waiting
     /// for an answer about one recording is never satisfied by another's.
     private func send(_ c: Ctrl, session: UInt16? = nil) {
-        guard let p = peripheral, let ch = ctrlChar else { return }
-        var bytes: [UInt8] = [c.rawValue]
-        if let s = session { bytes += [UInt8(s & 0xFF), UInt8(s >> 8)] }
-        p.writeValue(Data(bytes), for: ch, type: .withoutResponse)
+        if let p = peripheral, let ch = ctrlChar {
+            var bytes: [UInt8] = [c.rawValue]
+            if let s = session { bytes += [UInt8(s & 0xFF), UInt8(s >> 8)] }
+            p.writeValue(Data(bytes), for: ch, type: .withoutResponse)
+        }
+        wifiLink?.send(c, session: session)
+    }
+
+    // ---- the stick over Wi-Fi ------------------------------------------------
+    // The stick's WIFI app connects to us (TCP, authenticated and encrypted with the pairing key).
+    // Its frames go through the same handleFrame / finish / process path as the BLE ones; the
+    // stick uses one transport at a time, so the recording state is shared.
+    private var wifiReceiver: WifiReceiver?
+    private var wifiLink: WifiLink?
+    private var wifiBeat: Timer?
+
+    private func startWifi() {
+        guard let psk = wifiPairingKey() else {
+            log("Wi-Fi receiver off: put a pairing key of at least \(wifiKeyMinLength) characters in ~/.btmic-wifi-key")
+            return
+        }
+        let r = WifiReceiver(psk: psk, port: wifiPort)
+        r.onUp = { [weak self] l in self?.wifiUp(l) }
+        r.onDown = { [weak self] l in self?.wifiDown(l) }
+        r.onFrame = { [weak self] f in self?.handleFrame(f) }
+        do { try r.start(); wifiReceiver = r; log("Wi-Fi receiver listening on TCP port \(wifiPort)") }
+        catch { log("Wi-Fi receiver could not start: \(error.localizedDescription)") }
+    }
+
+    private func wifiUp(_ l: WifiLink) {
+        wifiLink?.hangUp()
+        wifiLink = l
+        log("Wi-Fi: stick at \(l.peer) passed the pairing-key check")
+        send(.ping)
+        wifiBeat?.invalidate()
+        wifiBeat = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.beat() }
+    }
+
+    private func wifiDown(_ l: WifiLink) {
+        guard wifiLink === l else { return }
+        wifiLink = nil
+        wifiBeat?.invalidate(); wifiBeat = nil
+        log("Wi-Fi: stick disconnected")
+    }
+}
+
+// MARK: - Wi-Fi receiver (the stick's WIFI app over the local network)
+//
+// Same protocol as tools/winvoice (docs/WIFI-PLAN.md, docs/firmware/wifi-lan/README.md); keep the
+// handshake and the record format in step with winvoice.py's _handshake() and main/wifimic.c:
+//   stick -> Mac: ns (16 random bytes)
+//   Mac -> stick: np (16 random) + HMAC-SHA256(key, "P" ns np)
+//   stick -> Mac: HMAC-SHA256(key, "S" np ns)
+//   then records: u16 length, AES-256-GCM ciphertext, 16-byte tag; the length is the AAD, the nonce
+//   is the 64-bit message counter (little-endian) + 4 zero bytes, one key per direction:
+//   HMAC(key, "1" ns np) stick -> Mac, HMAC(key, "2" ns np) Mac -> stick.
+//   stick -> Mac record: one docs/BT-MIC.md frame.   Mac -> stick record: 'C', status, session (u16).
+
+let wifiPort: UInt16 = UInt16(ProcessInfo.processInfo.environment["BTMIC_WIFI_PORT"] ?? "") ?? 47100
+let wifiKeyMinLength = 12
+
+/// The pairing key: BTMIC_WIFI_KEY, else the first line of ~/.btmic-wifi-key. Nil when missing or too short.
+func wifiPairingKey() -> Data? {
+    var key = ProcessInfo.processInfo.environment["BTMIC_WIFI_KEY"] ?? ""
+    if key.isEmpty {
+        let path = NSHomeDirectory() + "/.btmic-wifi-key"
+        if let s = try? String(contentsOfFile: path, encoding: .utf8) {
+            key = s.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+            if let perm = (try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions]) as? Int,
+               perm & 0o077 != 0 {
+                log("note: ~/.btmic-wifi-key can be read by other users; run: chmod 600 ~/.btmic-wifi-key")
+            }
+        }
+    }
+    key = key.trimmingCharacters(in: .whitespaces)
+    return key.utf8.count >= wifiKeyMinLength ? Data(key.utf8) : nil
+}
+
+private func wifiMac(_ psk: Data, _ tag: UInt8, _ x: Data, _ y: Data) -> Data {
+    var msg = Data([tag]); msg.append(x); msg.append(y)
+    return Data(HMAC<SHA256>.authenticationCode(for: msg, using: SymmetricKey(data: psk)))
+}
+
+private func wifiNonce(_ n: UInt64) -> AES.GCM.Nonce {
+    var d = Data(count: 12)
+    for i in 0..<8 { d[i] = UInt8((n >> (8 * UInt64(i))) & 0xFF) }
+    return try! AES.GCM.Nonce(data: d)
+}
+
+private enum WifiRead { case data(Data), idle, closed }
+
+/// Reads exactly n bytes. `.idle` only when the read timed out before the first byte.
+private func wifiReadExactly(_ fd: Int32, _ n: Int) -> WifiRead {
+    var buf = [UInt8](repeating: 0, count: n)
+    var got = 0
+    while got < n {
+        let r = buf.withUnsafeMutableBytes { recv(fd, $0.baseAddress! + got, n - got, 0) }
+        if r > 0 { got += r }
+        else if r < 0 && errno == EINTR { continue }
+        else if r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && got == 0 { return .idle }
+        else { return .closed }
+    }
+    return .data(Data(buf))
+}
+
+private func wifiWriteAll(_ fd: Int32, _ data: Data) -> Bool {
+    let total = data.count
+    var sent = 0
+    return data.withUnsafeBytes { raw in
+        while sent < total {
+            let w = send(fd, raw.baseAddress! + sent, total - sent, 0)
+            if w > 0 { sent += w } else if w < 0 && errno == EINTR { continue } else { return false }
+        }
+        return true
+    }
+}
+
+private func wifiSetTimeout(_ fd: Int32, seconds: Int) {
+    var tv = timeval(tv_sec: seconds, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+}
+
+/// A connected, authenticated stick.
+final class WifiLink {
+    let peer: String
+    private let fd: Int32
+    private let txKey: SymmetricKey
+    private let rxKey: SymmetricKey
+    private var txN: UInt64 = 0
+    private var rxN: UInt64 = 0
+    private var alive = true
+    private let lock = NSLock()
+
+    fileprivate init(fd: Int32, peer: String, txKey: Data, rxKey: Data) {
+        self.fd = fd; self.peer = peer
+        self.txKey = SymmetricKey(data: txKey); self.rxKey = SymmetricKey(data: rxKey)
+    }
+
+    /// Mac -> stick: 'C', status, session (u16 LE); session 0 = not about a recording (PING).
+    func send(_ c: Ctrl, session: UInt16?) {
+        let s = session ?? 0
+        let plain = Data([0x43, c.rawValue, UInt8(s & 0xFF), UInt8(s >> 8)])
+        lock.lock(); defer { lock.unlock() }
+        guard alive else { return }
+        let n = plain.count + 16
+        let hdr = Data([UInt8(n & 0xFF), UInt8(n >> 8)])
+        guard let box = try? AES.GCM.seal(plain, using: txKey, nonce: wifiNonce(txN), authenticating: hdr) else { return }
+        txN += 1
+        if !wifiWriteAll(fd, hdr + box.ciphertext + box.tag) { alive = false }
+    }
+
+    /// Ends the connection; the reading thread notices and cleans up.
+    func hangUp() { shutdown(fd, SHUT_RDWR) }
+
+    fileprivate func retire() { lock.lock(); alive = false; lock.unlock() }
+
+    /// One decrypted record from the stick.
+    fileprivate func readRecord() -> WifiRead {
+        switch wifiReadExactly(fd, 2) {
+        case .idle: return .idle
+        case .closed: return .closed
+        case .data(let head):
+            let n = Int(head[0]) | Int(head[1]) << 8
+            guard n >= 16 + 12, n <= 16 + 12 + 160 + 8 else {      // nothing the stick sends is outside this
+                log("Wi-Fi: bad record length \(n) from \(peer)"); return .closed
+            }
+            guard case .data(let body) = wifiReadExactly(fd, n) else { return .closed }
+            guard let box = try? AES.GCM.SealedBox(nonce: wifiNonce(rxN), ciphertext: body.prefix(n - 16), tag: body.suffix(16)),
+                  let plain = try? AES.GCM.open(box, using: rxKey, authenticating: head) else {
+                log("Wi-Fi: a record from \(peer) failed authentication; closing"); return .closed
+            }
+            rxN += 1
+            return .data(plain)
+        }
+    }
+}
+
+final class WifiReceiver {
+    private let psk: Data
+    private let port: UInt16
+    // These three are called on the main queue.
+    var onUp: (WifiLink) -> Void = { _ in }
+    var onDown: (WifiLink) -> Void = { _ in }
+    var onFrame: (ParsedFrame) -> Void = { _ in }
+
+    init(psk: Data, port: UInt16) { self.psk = psk; self.port = port }
+
+    func start() throws {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = 0
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        if bound < 0 || listen(fd, 2) < 0 {
+            let e = errno; close(fd)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(e))
+        }
+        Thread.detachNewThread { [self] in
+            while true {
+                var peerAddr = sockaddr_in()
+                var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let cfd = withUnsafeMutablePointer(to: &peerAddr) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &len) }
+                }
+                if cfd < 0 { if errno == EINTR { continue }; return }
+                let ip = UInt32(bigEndian: peerAddr.sin_addr.s_addr)
+                let text = String(cString: inet_ntoa(peerAddr.sin_addr))
+                guard Self.isLocalNetwork(ip) else {
+                    log("Wi-Fi: refused \(text) (not a local network address)")
+                    close(cfd); continue
+                }
+                Thread.detachNewThread { self.serve(cfd, peer: text) }
+            }
+        }
+    }
+
+    /// Loopback, private ranges and Tailscale. Defence in depth only: the pairing key is what keeps strangers out.
+    static func isLocalNetwork(_ ip: UInt32) -> Bool {
+        let a = ip >> 24, b = (ip >> 16) & 0xFF
+        return a == 127 || a == 10 || (a == 192 && b == 168) || (a == 172 && (16...31).contains(b)) || (a == 100 && (64...127).contains(b))
+    }
+
+    private func handshake(_ fd: Int32) -> (stickToMac: Data, macToStick: Data)? {
+        guard case .data(let ns) = wifiReadExactly(fd, 16) else { return nil }
+        var rnd = [UInt8](repeating: 0, count: 16)
+        guard SecRandomCopyBytes(kSecRandomDefault, 16, &rnd) == errSecSuccess else { return nil }
+        let np = Data(rnd)
+        guard wifiWriteAll(fd, np + wifiMac(psk, 0x50, ns, np)) else { return nil }          // "P"
+        guard case .data(let got) = wifiReadExactly(fd, 32) else { return nil }
+        let want = wifiMac(psk, 0x53, np, ns)                                                // "S"
+        var diff: UInt8 = 0
+        for (a, b) in zip(got, want) { diff |= a ^ b }
+        guard diff == 0 else { return nil }
+        return (wifiMac(psk, 0x31, ns, np), wifiMac(psk, 0x32, ns, np))                      // "1", "2"
+    }
+
+    private func serve(_ fd: Int32, peer: String) {
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        wifiSetTimeout(fd, seconds: 5)
+        guard let keys = handshake(fd) else {
+            log("Wi-Fi: refused \(peer): it did not prove it knows the pairing key")
+            close(fd); return
+        }
+        wifiSetTimeout(fd, seconds: 30)   // the stick only talks while recording; our pings keep the link warm
+        let link = WifiLink(fd: fd, peer: peer, txKey: keys.macToStick, rxKey: keys.stickToMac)
+        DispatchQueue.main.async { self.onUp(link) }
+        loop: while true {
+            switch link.readRecord() {
+            case .idle: continue
+            case .closed: break loop
+            case .data(let plain):
+                guard plain.count >= 12, let f = parseFrame([UInt8](plain)) else { break loop }
+                DispatchQueue.main.async { self.onFrame(f) }
+            }
+        }
+        link.retire()
+        close(fd)
+        DispatchQueue.main.async { self.onDown(link) }
     }
 }
 
@@ -753,6 +1023,102 @@ final class Probe: NSObject, CBCentralManagerDelegate {
 }
 
 // MARK: - Entry point
+
+/// `btmic wifi-selftest`: the receiver and a stand-in for the stick (same steps as main/wifimic.c)
+/// talk over loopback; no Bluetooth, no transcription, nothing is pasted.
+func wifiSelfTest() -> Never {
+    let key = Data("selftest-pairing-key-0123".utf8)
+    let wrong = Data("not-the-pairing-key-0000".utf8)
+    let port: UInt16 = 47198
+    final class State { var frames = 0, ends = 0, ups = 0, downs = 0; var link: WifiLink? }
+    let st = State()
+    let rx = WifiReceiver(psk: key, port: port)
+    rx.onUp = { l in st.ups += 1; st.link = l; l.send(.ping, session: nil) }
+    rx.onDown = { _ in st.downs += 1 }
+    rx.onFrame = { f in
+        st.frames += 1
+        if f.type == .end { st.ends += 1; st.link?.send(.done, session: f.session) }
+    }
+    do { try rx.start() } catch { fail("cannot listen on \(port): \(error.localizedDescription)") }
+
+    func connectLocal() -> Int32? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        var a = sockaddr_in()
+        a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); a.sin_family = sa_family_t(AF_INET)
+        a.sin_port = port.bigEndian; a.sin_addr.s_addr = UInt32(0x7F000001).bigEndian
+        let rc = withUnsafePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        if rc < 0 { close(fd); return nil }
+        wifiSetTimeout(fd, seconds: 3)
+        return fd
+    }
+
+    /// The stick's side. checkPC = false skips the check of the PC's proof (to see the PC refuse us).
+    func stick(key k: Data, checkPC: Bool, frames: Int) -> (connected: Bool, ctrl: [[UInt8]]) {
+        guard let fd = connectLocal() else { return (false, []) }
+        defer { close(fd) }
+        var r = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &r)
+        let ns = Data(r)
+        guard wifiWriteAll(fd, ns), case .data(let resp) = wifiReadExactly(fd, 48) else { return (false, []) }
+        let np = Data(resp.prefix(16))
+        if checkPC && Data(resp.suffix(32)) != wifiMac(k, 0x50, ns, np) { return (false, []) }
+        guard wifiWriteAll(fd, wifiMac(k, 0x53, np, ns)) else { return (false, []) }
+        let tx = SymmetricKey(data: wifiMac(k, 0x31, ns, np)), rxk = SymmetricKey(data: wifiMac(k, 0x32, ns, np))
+        var txN: UInt64 = 0
+        func put(_ f: [UInt8]) {
+            let n = f.count + 16
+            let hdr = Data([UInt8(n & 0xFF), UInt8(n >> 8)])
+            guard let box = try? AES.GCM.seal(Data(f), using: tx, nonce: wifiNonce(txN), authenticating: hdr) else { return }
+            txN += 1
+            _ = wifiWriteAll(fd, hdr + box.ciphertext + box.tag)
+        }
+        var enc = AdpcmState()
+        put(makeFrame(type: .start, session: 7, seq: 0, pcm: [], state: &enc))
+        for i in 1...max(frames, 1) {
+            put(makeFrame(type: .audio, session: 7, seq: UInt16(i), pcm: [Int16](repeating: 1000, count: samplesPerFrame), state: &enc))
+        }
+        put(makeFrame(type: .end, session: 7, seq: UInt16(frames + 1), pcm: [], state: &enc))
+        var got: [[UInt8]] = []
+        var rxN: UInt64 = 0
+        while case .data(let head) = wifiReadExactly(fd, 2) {
+            let n = Int(head[0]) | Int(head[1]) << 8
+            guard case .data(let body) = wifiReadExactly(fd, n),
+                  let box = try? AES.GCM.SealedBox(nonce: wifiNonce(rxN), ciphertext: body.prefix(n - 16), tag: body.suffix(16)),
+                  let plain = try? AES.GCM.open(box, using: rxk, authenticating: head) else { break }
+            rxN += 1
+            got.append([UInt8](plain))
+            if got.count >= 2 { break }
+        }
+        return (true, got)
+    }
+
+    var good: (connected: Bool, ctrl: [[UInt8]]) = (false, [])
+    var wrongStrict = (connected: true, ctrl: [[UInt8]]())
+    var wrongLenient = (connected: true, ctrl: [[UInt8]]())
+    let done = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+        good = stick(key: key, checkPC: true, frames: 30)
+        wrongStrict = stick(key: wrong, checkPC: true, frames: 5)
+        wrongLenient = stick(key: wrong, checkPC: false, frames: 5)
+        done.signal()
+    }
+    let deadline = Date().addingTimeInterval(20)
+    while done.wait(timeout: .now()) == .timedOut && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+
+    var failures: [String] = []
+    func check(_ ok: Bool, _ what: String) { print((ok ? "ok   " : "FAIL ") + what); if !ok { failures.append(what) } }
+    check(good.connected, "stick with the right key connects")
+    check(st.frames == 32 && st.ends == 1, "receiver got start + 30 audio + end (\(st.frames) frames, \(st.ends) ends)")
+    check(good.ctrl.first == [0x43, 5, 0, 0], "stick got the PING record")
+    check(good.ctrl.dropFirst().first == [0x43, 2, 7, 0], "stick got DONE for session 7")
+    check(!wrongStrict.connected, "stick with a wrong key notices the PC does not match")
+    check(wrongLenient.ctrl.isEmpty && st.ups == 1, "PC refuses a stick with a wrong key (links up: \(st.ups))")
+    check(st.frames == 32, "refused sticks delivered no frames")
+    check(WifiReceiver.isLocalNetwork(0xC0A80170) && !WifiReceiver.isLocalNetwork(0x08080808), "address filter")
+    print(failures.isEmpty ? "wifi selftest passed" : "wifi selftest FAILED: \(failures.count)")
+    exit(failures.isEmpty ? 0 : 1)
+}
 
 func fail(_ s: String) -> Never { FileHandle.standardError.write(Data((s + "\n").utf8)); exit(1) }
 
@@ -805,6 +1171,8 @@ case "selftest":
         if args.contains("--paste") { deliver(text, pressReturn: false) }
         print("temp: \(tmp.path)   (move to Trash when done)")
     } catch { fail("error: \(error.localizedDescription)") }
+case "wifi-selftest":
+    wifiSelfTest()
 case "probe":
     let probe = Probe()
     withExtendedLifetime(probe) { RunLoop.main.run() }
